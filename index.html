@@ -14,16 +14,25 @@
 
   <script type="text/babel">
     const { useMemo, useState } = React;
+
     const API_ENDPOINT = "/.netlify/functions/create-deeplink";
+    const PRODUCT_INFO_ENDPOINT = "/.netlify/functions/product-info";
     const PING_ENDPOINT = "/.netlify/functions/ping";
 
-    // URL 화이트리스트(영문/숫자/ : / ? & = . _ - 만)
+    // URL 화이트리스트(영문/숫자/ : / ? & = . _ - 만) - 입력 중 필터용
     const filterUrl = (s) => (s || '').replace(/[^a-zA-Z0-9:\/?&=._-]/g, '');
+
+    // 문장 속 첫 번째 http(s) URL만 추출 (최종 호출 직전에 사용)
+    const extractFirstUrl = (s) => {
+      const m = String(s || '').match(/https?:\/\/[^\s]+/);
+      return m ? m[0] : '';
+    };
 
     function App() {
       const [pingOk, setPingOk] = useState(null);
       const [inputUrl, setInputUrl] = useState("");
       const [isComposing, setIsComposing] = useState(false);
+
       const [productName, setProductName] = useState("");
       const [price, setPrice] = useState("");
       const [qty, setQty] = useState("1");
@@ -33,12 +42,6 @@
       const [partnerUrl, setPartnerUrl] = useState("");
       const [error, setError] = useState("");
 
-      const total = useMemo(() => {
-        const p = Number(price || 0);
-        const q = Number(qty || 0);
-        if (!isFinite(p) || !isFinite(q)) return 0;
-        return p * q;
-      }, [price, qty]);
       const formatted = (v) => new Intl.NumberFormat("ko-KR").format(Number(v || 0));
 
       const fixedTemplate = useMemo(() => {
@@ -70,25 +73,52 @@
         setApiRaw("");
         setPartnerUrl("");
 
+        // 입력된 문자열에서 첫 번째 http(s) URL만 뽑음
+        const cleanUrl = extractFirstUrl(inputUrl);
+        if (!cleanUrl) {
+          setLoading(false);
+          setError("쿠팡 상품 링크를 입력하세요.");
+          return;
+        }
+
         try {
-          const res = await fetch(API_ENDPOINT, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ url: inputUrl.trim() })
-          });
+          // 딥링크 생성 + 상품정보 추출을 병렬로 호출
+          const [deepRes, infoRes] = await Promise.allSettled([
+            fetch(API_ENDPOINT, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ url: cleanUrl })
+            }).then(async (r) => {
+              const t = await r.text();
+              setApiRaw(t);
+              const j = JSON.parse(t);
+              if (!r.ok || j.success === false) {
+                throw new Error(j?.error?.message || j?.reason || `HTTP ${r.status}`);
+              }
+              return j;
+            }),
+            fetch(PRODUCT_INFO_ENDPOINT, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ url: cleanUrl })
+            }).then(r => r.json()).catch(() => null)
+          ]);
 
-          const text = await res.text();
-          setApiRaw(text);
-
-          const data = JSON.parse(text);
-          if (!res.ok || data.success === false) {
-            throw new Error(data?.error?.message || data?.reason || `HTTP ${res.status}`);
+          // 딥링크 처리
+          if (deepRes.status === "fulfilled") {
+            const data = deepRes.value;
+            const deeplink = data.deeplink || data.link;
+            setPartnerUrl(deeplink);
+          } else {
+            throw deepRes.reason;
           }
-          // 서버에서 받은 딥링크/상품정보 반영
-          const deeplink = data.deeplink || data.link;
-          setPartnerUrl(deeplink);
-          if (data.info?.name && !productName) setProductName(data.info.name);
-          if (Number.isFinite(data.info?.price) && !price) setPrice(String(data.info.price));
+
+          // 상품 정보 처리(성공 시에만 반영, 기존 값 있으면 덮어쓰지 않음)
+          if (infoRes.status === "fulfilled" && infoRes.value?.success) {
+            const info = infoRes.value.info || {};
+            if (info.name && !productName) setProductName(info.name);
+            if (Number.isFinite(info.price) && !price) setPrice(String(info.price));
+          }
         } catch (e) {
           setError(e?.message || String(e));
         } finally {
@@ -136,7 +166,7 @@
                   onChange={handleUrlChange}
                   onCompositionStart={handleUrlCompositionStart}
                   onCompositionEnd={handleUrlCompositionEnd}
-                  placeholder="상품 원본 URL 또는 coupa.ng / link.coupang.com"
+                  placeholder="문장 전체 붙여넣기 OK · 첫 번째 http(s) URL만 자동 인식"
                   className="w-full rounded-xl border p-4 text-base"
                   inputMode="url"
                   autoCapitalize="off"
@@ -171,24 +201,6 @@
               </div>
 
               {error && <div className="text-sm sm:text-base text-red-600 bg-red-50 border border-red-200 rounded-xl p-3">{error}</div>}
-            </div>
-
-            <div className="rounded-2xl bg-white shadow p-4 grid gap-3">
-              <div className="text-sm text-neutral-500">요약</div>
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-base">
-                <div className="rounded-xl border p-4">
-                  <div className="text-neutral-500 text-sm">단가</div>
-                  <div className="font-medium">{price ? formatted(price) + "원" : "-"}</div>
-                </div>
-                <div className="rounded-xl border p-4">
-                  <div className="text-neutral-500 text-sm">수량</div>
-                  <div className="font-medium">{qty || "-"}</div>
-                </div>
-                <div className="rounded-xl border p-4">
-                  <div className="text-neutral-500 text-sm">합계</div>
-                  <div className="font-medium">{total ? formatted(total) + "원" : "-"}</div>
-                </div>
-              </div>
             </div>
 
             <div className="rounded-2xl bg-white shadow p-4 grid gap-3">
