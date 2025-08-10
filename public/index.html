@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>쿠팡 딥링크 생성기</title>
+<style>
+  body { font-family: Arial, sans-serif; margin: 20px; }
+  input, button { padding: 8px; margin: 4px 0; }
+  .card { border: 1px solid #ccc; border-radius: 8px; padding: 16px; margin-bottom: 20px; }
+  pre { background: #f9f9f9; padding: 10px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<h1>쿠팡 파트너스 딥링크 생성</h1>
+
+<div class="card">
+  <label>원본 또는 짧은 링크<br>
+    <input id="url" style="width:100%" placeholder="https://link.coupang.com/...">
+  </label><br>
+  <label>상품명<br>
+    <input id="name" style="width:100%" placeholder="상품명">
+  </label><br>
+  <label>가격(원)<br>
+    <input id="price" style="width:100%" placeholder="12000">
+  </label><br>
+  <label>수량<br>
+    <input id="qty" style="width:100%" placeholder="1">
+  </label><br>
+  <button onclick="createLink()">딥링크 생성</button>
+</div>
+
+<div class="card">
+  <h3>파트너스 링크</h3>
+  <div id="partnerUrl">(아직 없음)</div>
+</div>
+
+<div class="card">
+  <h3>템플릿 미리보기</h3>
+  <pre id="templatePreview"></pre>
+  <button onclick="copyTemplate()">템플릿 복사</button>
+</div>
+
+<div class="card">
+  <h3>API 응답</h3>
+  <pre id="apiResponse"></pre>
+</div>
+
+<script>
+async function createLink() {
+  const url = document.getElementById("url").value.trim();
+  const name = document.getElementById("name").value.trim();
+  const price = document.getElementById("price").value.trim();
+  const qty = document.getElementById("qty").value.trim() || "1";
+
+  const res = await fetch("/.netlify/functions/create-deeplink", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url })
+  });
+  const data = await res.json();
+  document.getElementById("apiResponse").textContent = JSON.stringify(data, null, 2);
+
+  if (data.success) {
+    document.getElementById("partnerUrl").textContent = data.link;
+    const formattedPrice = price ? new Intl.NumberFormat("ko-KR").format(Number(price)) + "원" : "가격정보";
+    const template = `【쿠팡】${name || "상품명"}\n가격: ${formattedPrice}\n링크: ${data.link}\n\n※ 모든 핫딜은 카드 할인 및 쿠폰 적용가 기준입니다.\n※ 이 포스팅은 쿠팡파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받습니다. 구입 시 제품 가격에는 아무런 영향이 없습니다.`;
+    document.getElementById("templatePreview").textContent = template;
+  } else {
+    document.getElementById("partnerUrl").textContent = "(생성 실패)";
+    document.getElementById("templatePreview").textContent = "";
+  }
+}
+
+function copyTemplate() {
+  const text = document.getElementById("templatePreview").textContent;
+  navigator.clipboard.writeText(text).then(() => alert("복사 완료"));
+}
+</script>
+</body>
+</html>
