@@ -8,7 +8,7 @@ const PATH = "/v2/providers/affiliate_open_api/apis/openapi/v1/deeplink";
 const ACCESS = process.env.COUPANG_ACCESS_KEY;
 const SECRET = process.env.COUPANG_SECRET_KEY;
 
-// 모바일 UA (일부 페이지가 UA 따라 데이터 노출)
+// 모바일 UA (일부 페이지가 UA에 따라 데이터 노출)
 const UA_MOBILE =
   "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1";
 
@@ -24,7 +24,8 @@ function utcSignedDate() {
     p(d.getUTCSeconds()) + "Z"
   );
 }
-function buildAuth(method, path, query="") {
+
+function buildAuth(method, path, query = "") {
   const datetime = utcSignedDate();
   const message = `${datetime}${method.toUpperCase()}${path}${query}`;
   const signature = crypto.createHmac("sha256", SECRET).update(message, "utf8").digest("hex");
@@ -32,35 +33,67 @@ function buildAuth(method, path, query="") {
   return { header, datetime, message, signature };
 }
 
-// link.coupang.com → www.coupang.com 으로 해제
+// --- short 링크 해제 (link.coupang.com / coupa.ng → coupang.com) ---
 async function resolveShortIfNeeded(inputUrl) {
-  if (!/^https?:\/\/link\.coupang\.com\//i.test(inputUrl)) return inputUrl;
+  const isShort = /^https?:\/\/(link\.coupang\.com|coupa\.ng)\//i.test(inputUrl);
+  if (!isShort) return inputUrl;
+
   let cur = inputUrl;
-  for (let i = 0; i < 5; i++) {
-    const r = await axios
+  // 최대 6회까지 30x 따라감. HEAD 실패 시 GET으로 재시도.
+  for (let i = 0; i < 6; i++) {
+    let r = await axios
       .head(cur, {
         maxRedirects: 0,
         validateStatus: s => s >= 200 && s < 400,
         timeout: 15000,
         headers: { "User-Agent": UA_MOBILE }
       })
-      .catch(e => e.response);
-    if (!r) break;
-    const loc = r.headers?.location;
-    if (!loc) break;
+      .catch(e => e?.response);
+
+    if (!r || !r.headers?.location) {
+      r = await axios
+        .get(cur, {
+          maxRedirects: 0,
+          validateStatus: s => s >= 200 && s < 400,
+          timeout: 15000,
+          headers: { "User-Agent": UA_MOBILE }
+        })
+        .catch(e => e?.response);
+    }
+
+    if (!r || !r.headers?.location) {
+      // 마지막 수단: 자동 리다이렉트 따라가며 최종 URL 얻기
+      try {
+        const followed = await axios.get(cur, {
+          maxRedirects: 5,
+          timeout: 15000,
+          headers: { "User-Agent": UA_MOBILE }
+        });
+        const finalUrl =
+          followed?.request?.res?.responseUrl ||
+          followed?.request?.responseURL ||
+          cur;
+        return finalUrl;
+      } catch {
+        return cur;
+      }
+    }
+
+    const loc = r.headers.location;
     cur = new URL(loc, cur).toString();
-    if (/^https?:\/\/(www\.)?coupang\.com\//i.test(cur)) return cur;
+
+    if (/^https?:\/\/(?:www\.|m\.)?coupang\.com\//i.test(cur)) return cur;
   }
   return cur;
 }
 
-// products/{id} 추출
+// --- productId 추출 (긴 링크에서)
 function extractProductId(url) {
   const m = url.match(/\/products\/(\d+)/);
   return m ? m[1] : null;
 }
 
-// 모바일 페이지에서 이름/가격 파싱(여러 키 방어)
+// --- 모바일 상품페이지에서 이름/가격 파싱
 async function fetchProductInfo(productId) {
   const mobileUrl = `https://m.coupang.com/vp/products/${productId}`;
   const { data: html } = await axios.get(mobileUrl, {
@@ -68,7 +101,7 @@ async function fetchProductInfo(productId) {
     headers: { "User-Agent": UA_MOBILE }
   });
 
-  // 이름: og:title → productName
+  // 1) 상품명: og:title → productName
   let name = null;
   const og = html.match(/<meta\s+property="og:title"\s+content="([^"]+)"/i);
   if (og) name = og[1];
@@ -76,14 +109,12 @@ async function fetchProductInfo(productId) {
     const m = html.match(/"productName"\s*:\s*"([^"]+)"/i);
     if (m) name = m[1];
   }
-  if (name) {
-    // 불필요 꼬리말 정리
-    name = name.replace(/\s*\|.*$/, "").trim();
-  }
+  if (name) name = name.replace(/\s*\|.*$/, "").trim();
 
-  // 가격: 여러 필드 중 최솟값
+  // 2) 가격: 여러 키 중 최솟값 사용
   const prices = [];
-  const rx = /"(salePrice|discountedPrice|discountPrice|originPrice|price|unitPrice|wowPrice)"\s*:\s*(\d{2,})/gi;
+  const rx =
+    /"(salePrice|discountedPrice|discountPrice|originPrice|price|unitPrice|wowPrice)"\s*:\s*(\d{2,})/gi;
   let mm;
   while ((mm = rx.exec(html)) !== null) {
     const v = parseInt(mm[2], 10);
@@ -91,7 +122,7 @@ async function fetchProductInfo(productId) {
   }
   const price = prices.length ? Math.min(...prices) : null;
 
-  return { name, price, productId, source: "mobile", url: mobileUrl };
+  return { name, price, productId, url: mobileUrl, source: "mobile" };
 }
 
 exports.handler = async (event) => {
@@ -99,64 +130,141 @@ exports.handler = async (event) => {
   const debug = qs.debug === "1";
 
   if (event.httpMethod !== "POST") {
-    return { statusCode: 405, body: JSON.stringify({ success:false, error:{ code:"METHOD_NOT_ALLOWED", message:"POST only" }}) };
+    return {
+      statusCode: 405,
+      body: JSON.stringify({
+        success: false,
+        error: { code: "METHOD_NOT_ALLOWED", message: "POST only" }
+      })
+    };
   }
 
+  // body 파싱
   let url = "";
   try {
     const body = JSON.parse(event.body || "{}");
     url = (body.url || "").trim();
   } catch {
-    return { statusCode: 400, body: JSON.stringify({ success:false, error:{ code:"BAD_JSON", message:"Invalid JSON body" }}) };
-  }
-  if (!url) return { statusCode: 400, body: JSON.stringify({ success:false, error:{ code:"URL_REQUIRED", message:"url required" }}) };
-
-  // 1) 짧은 → 원본
-  let finalUrl;
-  try { finalUrl = await resolveShortIfNeeded(url); }
-  catch (e) {
-    return { statusCode: 502, body: JSON.stringify({ success:false, error:{ code:"RESOLVE_FAILED", message:String(e?.message || e) }, input:{ url } }) };
-  }
-  if (!/^https?:\/\/(www\.)?coupang\.com\//i.test(finalUrl)) {
-    return { statusCode: 400, body: JSON.stringify({ success:false, error:{ code:"INVALID_URL", message:"쿠팡 상품 원본 URL이 아닙니다." }, input:{ url, finalUrl } }) };
-  }
-
-  // 2) 상품명/가격
-  const productId = extractProductId(finalUrl);
-  let info = null;
-  if (productId) {
-    try { info = await fetchProductInfo(productId); }
-    catch { info = null; }
-  }
-
-  // 3) 딥링크
-  const { header, datetime, message, signature } = buildAuth("POST", PATH, "");
-  const resp = await axios.post(`${HOST}${PATH}`, { coupangUrls: [finalUrl] }, {
-    headers: { Authorization: header, "Content-Type": "application/json" },
-    timeout: 15000,
-    validateStatus: () => true
-  }).catch(e => e?.response || { status: 502, data: { message: String(e) } });
-
-  // debug 응답
-  if (debug) {
     return {
-      statusCode: resp.status,
+      statusCode: 400,
       body: JSON.stringify({
-        success: resp.status === 200 && resp.data?.data?.length > 0,
-        upstreamStatus: resp.status,
-        upstreamData: resp.data,
-        debug: { datetime, message, signature: signature.slice(0,16)+"..." },
-        input: { url, finalUrl, productId },
-        info
+        success: false,
+        error: { code: "BAD_JSON", message: "Invalid JSON body" }
+      })
+    };
+  }
+  if (!url) {
+    return {
+      statusCode: 400,
+      body: JSON.stringify({
+        success: false,
+        error: { code: "URL_REQUIRED", message: "url required" }
       })
     };
   }
 
-  if (resp.status === 200 && resp.data?.data?.length) {
-    const item = resp.data.data[0];
-    const deeplink = item?.shortenUrl || item?.landingUrl || null;
-    return { statusCode: 200, body: JSON.stringify({ success:true, deeplink, info }) };
+  // 1) 짧은링크면 먼저 원본으로 해제
+  let finalUrl;
+  try {
+    finalUrl = await resolveShortIfNeeded(url);
+  } catch (e) {
+    return {
+      statusCode: 502,
+      body: JSON.stringify({
+        success: false,
+        error: { code: "RESOLVE_FAILED", message: String(e?.message || e) },
+        input: { url, finalUrl: null }
+      })
+    };
   }
 
-  return { statusCode: 502, body: JSON.stringify({ success:false, reason:"UPSTREAM_ERROR", status: resp.status, data: resp.data, input:{ url, finalUrl }, info }) };
+  // 2) 원본 도메인 검증 (www / m 허용, 단축도메인은 제외)
+  if (!/^https?:\/\/(?:www\.|m\.)?coupang\.com\//i.test(finalUrl)) {
+    return {
+      statusCode: 400,
+      body: JSON.stringify({
+        success: false,
+        error: {
+          code: "INVALID_URL",
+          message: "쿠팡 상품 원본 URL로 해제되지 않았습니다."
+        },
+        input: { url, finalUrl }
+      })
+    };
+  }
+
+  // 3) 상품명/가격 파싱 (가능하면)
+  let info = null;
+  const productId = extractProductId(finalUrl);
+  if (productId) {
+    try {
+      info = await fetchProductInfo(productId);
+    } catch {
+      info = null; // 파싱 실패해도 링크 생성은 계속
+    }
+  }
+
+  // 4) 딥링크 생성
+  const { header, datetime, message, signature } = buildAuth("POST", PATH, "");
+  try {
+    const resp = await axios.post(
+      `${HOST}${PATH}`,
+      { coupangUrls: [finalUrl] },
+      {
+        headers: { Authorization: header, "Content-Type": "application/json" },
+        timeout: 15000,
+        validateStatus: () => true
+      }
+    );
+
+    // debug 모드 응답
+    if (debug) {
+      return {
+        statusCode: resp.status,
+        body: JSON.stringify({
+          success: resp.status === 200 && resp.data?.data?.length > 0,
+          upstreamStatus: resp.status,
+          upstreamData: resp.data,
+          debug: { datetime, message, signature: signature.slice(0, 16) + "..." },
+          input: { url, finalUrl, productId },
+          info
+        })
+      };
+    }
+
+    if (resp.status === 200 && resp.data?.data?.length) {
+      const item = resp.data.data[0];
+      const link = item?.shortenUrl || item?.landingUrl || null;
+      return {
+        statusCode: 200,
+        body: JSON.stringify({ success: true, link, info })
+      };
+    }
+
+    // 업스트림이 200인데 rCode 400 같은 경우를 위해 원문 그대로 반환
+    return {
+      statusCode: 502,
+      body: JSON.stringify({
+        success: false,
+        reason: "UPSTREAM_ERROR",
+        status: resp.status,
+        data: resp.data,
+        input: { url, finalUrl },
+        info
+      })
+    };
+  } catch (e) {
+    return {
+      statusCode: 502,
+      body: JSON.stringify({
+        success: false,
+        error: {
+          code: "UPSTREAM_ERROR",
+          message: String(e?.response?.data || e.message)
+        },
+        input: { url, finalUrl },
+        info
+      })
+    };
+  }
 };
