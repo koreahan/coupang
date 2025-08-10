@@ -1,172 +1,73 @@
-const axios = require("axios");
 const crypto = require("crypto");
+const axios = require("axios");
 
-const TIMEOUT_MS = 7000;
-const MAX_REDIRECTS = 5;
+const HOST = "https://api-gateway.coupang.com";
+const PATH = "/v2/providers/affiliate_open_api/apis/openapi/v1/deeplink";
 
-function json(statusCode, payload) {
-  return {
-    statusCode,
-    headers: { "Content-Type": "application/json; charset=utf-8" },
-    body: JSON.stringify(payload)
-  };
+const ACCESS = process.env.COUPANG_ACCESS_KEY;
+const SECRET = process.env.COUPANG_SECRET_KEY;
+
+function utcSignedDate() {
+  const d = new Date();
+  const p = n => String(n).padStart(2, "0");
+  return String(d.getUTCFullYear()).slice(2) + p(d.getUTCMonth()+1) + p(d.getUTCDate()) +
+         "T" + p(d.getUTCHours()) + p(d.getUTCMinutes()) + p(d.getUTCSeconds()) + "Z";
 }
-
-function isShortCoupang(u) {
-  try {
-    const { hostname } = new URL(u);
-    return ["coupa.ng", "link.coupang.com"].includes(hostname);
-  } catch { return false; }
-}
-
-async function resolveShortUrl(u) {
-  let current = u;
-  for (let i = 0; i < MAX_REDIRECTS; i++) {
-    const res = await axios.get(current, {
-      maxRedirects: 0,
-      validateStatus: s => s >= 200 && s < 400,
-      timeout: TIMEOUT_MS,
-      headers: { "User-Agent": "Mozilla/5.0 (NetlifyFunction; CoupangResolver)" }
-    }).catch(err => {
-      if (err.response) return err.response;
-      throw err;
-    });
-
-    if (res.status >= 300 && res.status < 400 && res.headers.location) {
-      const next = new URL(res.headers.location, current).toString();
-      current = next;
-      continue;
-    }
-    return current;
-  }
-  return current;
-}
-
-function buildSignature(secret, datetime, method, pathWithQuery) {
-  const message = datetime + method + pathWithQuery + "\n";
-  return crypto.createHmac("sha256", secret).update(message).digest("base64");
-}
-
-function nowIso() {
-  return new Date().toISOString();
+function buildAuth(method, path, query="") {
+  const datetime = utcSignedDate();
+  const message = `${datetime}${method.toUpperCase()}${path}${query}`;
+  const signature = crypto.createHmac("sha256", SECRET).update(message, "utf8").digest("hex");
+  const header = `CEA algorithm=HmacSHA256,access-key=${ACCESS},signed-date=${datetime},signature=${signature}`;
+  return { header, datetime, message, signature };
 }
 
 exports.handler = async (event) => {
-  const ts = nowIso();
+  const qs = event.queryStringParameters || {};
+  const debug = qs.debug === "1";
 
   if (event.httpMethod !== "POST") {
-    return json(405, {
-      success: false,
-      error: { code: "METHOD_NOT_ALLOWED", message: "POST only" }
-    });
+    return { statusCode: 405, body: JSON.stringify({ success:false, error:{ code:"METHOD_NOT_ALLOWED", message:"POST only" }}) };
   }
 
-  const ACCESS = process.env.COUPANG_ACCESS_KEY;
-  const SECRET = process.env.COUPANG_SECRET_KEY;
-  const SUB_ID = process.env.COUPANG_SUB_ID;
-  if (!ACCESS || !SECRET || !SUB_ID) {
-    return json(500, {
-      success: false,
-      error: { code: "MISSING_ENV", message: "Coupang credentials missing" }
-    });
-  }
-
-  let body;
-  try { body = JSON.parse(event.body || "{}"); } catch {
-    return json(400, { success: false, error: { code: "BAD_JSON", message: "Invalid JSON body" } });
-  }
-  const inputUrl = (body.url || "").trim();
-  if (!inputUrl) {
-    return json(400, { success: false, error: { code: "BAD_REQUEST", message: "'url' is required" } });
-  }
-
-  let resolvedUrl = inputUrl;
-  let wasShort = false;
+  let url = "";
   try {
-    if (isShortCoupang(inputUrl)) {
-      wasShort = true;
-      resolvedUrl = await resolveShortUrl(inputUrl);
-    }
-  } catch (e) {
-    return json(502, {
-      success: false,
-      error: { code: "RESOLVE_FAILED", message: "Failed to resolve short link", details: String(e.message || e) },
-      input: { url: inputUrl, resolvedUrl: null, isShort: true }
-    });
+    const body = JSON.parse(event.body || "{}");
+    url = (body.url || "").trim();
+  } catch {
+    return { statusCode: 400, body: JSON.stringify({ success:false, error:{ code:"BAD_JSON", message:"Invalid JSON body" }}) };
   }
+  if (!url) return { statusCode: 400, body: JSON.stringify({ success:false, error:{ code:"URL_REQUIRED", message:"url required" }}) };
 
-  const domain = "https://api-gateway.coupang.com";
-  const path = "/v2/providers/affiliate_open_api/apis/openapi/v1/deeplink";
-
-  const datetime = new Date().toISOString().replace(/[-:]/g, "").slice(0, 15) + "Z";
-  const signature = buildSignature(SECRET, datetime, "POST", path);
+  // ★ 짧은링크/원본링크 그대로 전달
+  const { header, datetime, message, signature } = buildAuth("POST", PATH, "");
 
   try {
-    const resp = await axios.post(
-      domain + path,
-      { coupangUrls: [resolvedUrl] },
-      {
-        timeout: TIMEOUT_MS,
-        headers: {
-          "Content-Type": "application/json",
-          "X-COUPANG-API-TIMESTAMP": datetime,
-          "X-COUPANG-API-SIGNATURE": signature,
-          "X-COUPANG-API-ACCESS-KEY": ACCESS,
-          "X-COUPANG-API-SUB-ID": SUB_ID,
-        },
-        validateStatus: s => s >= 200 && s < 500,
-      }
-    );
+    const resp = await axios.post(`${HOST}${PATH}`, { coupangUrls: [url] }, {
+      headers: { "Authorization": header, "Content-Type": "application/json" },
+      timeout: 15000,
+      validateStatus: () => true
+    });
 
-    if (resp.status >= 200 && resp.status < 300) {
-      let link = "";
-      try {
-        const arr = resp.data?.data || resp.data?.content || resp.data?.result;
-        if (Array.isArray(arr) && arr.length) {
-          const it = arr[0];
-          link = it.deeplink || it.deepLink || it.shortenUrl || it.shortUrl || it.trackingUrl || it.coupangUrl || it.landingUrl || "";
-          if (!link) {
-            for (const v of Object.values(it)) {
-              if (typeof v === "string" && /^https?:\/\//i.test(v)) { link = v; break; }
-            }
-          }
-        }
-      } catch {}
-
-      if (!link) {
-        return json(502, {
-          success: false,
-          error: { code: "PARSE_ERROR", message: "Could not extract deeplink from Coupang response" },
-          input: { url: inputUrl, resolvedUrl, isShort: wasShort },
-          meta: { provider: "coupang", ts }
-        });
-      }
-
-      return json(200, {
-        success: true,
-        link,
-        input: { url: inputUrl, resolvedUrl, isShort: wasShort },
-        meta: { provider: "coupang", ts }
-      });
+    if (debug) {
+      return {
+        statusCode: resp.status,
+        body: JSON.stringify({
+          success: resp.status === 200,
+          upstreamStatus: resp.status,
+          upstreamData: resp.data,
+          debug: { datetime, message, signature: signature.slice(0,16)+"..." },
+          input: { url }
+        })
+      };
     }
 
-    return json(resp.status, {
-      success: false,
-      error: {
-        code: "COUPANG_ERROR",
-        message: resp.data?.message || `Coupang API error (HTTP ${resp.status})`,
-        details: resp.data || null
-      },
-      input: { url: inputUrl, resolvedUrl, isShort: wasShort },
-      meta: { provider: "coupang", ts }
-    });
-
+    if (resp.status === 200 && resp.data?.data?.length) {
+      const item = resp.data.data[0];
+      const link = item?.shortenUrl || item?.landingUrl || null;
+      return { statusCode: 200, body: JSON.stringify({ success:true, link, raw: resp.data }) };
+    }
+    return { statusCode: 502, body: JSON.stringify({ success:false, reason:"UPSTREAM_ERROR", status: resp.status, data: resp.data }) };
   } catch (e) {
-    return json(502, {
-      success: false,
-      error: { code: "NETWORK_ERROR", message: "Network/timeout calling Coupang API", details: String(e.message || e) },
-      input: { url: inputUrl, resolvedUrl, isShort: wasShort },
-      meta: { provider: "coupang", ts }
-    });
+    return { statusCode: 502, body: JSON.stringify({ success:false, error:String(e?.response?.data || e.message), input:{ url } }) };
   }
 };
