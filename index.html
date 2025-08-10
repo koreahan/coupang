@@ -14,18 +14,17 @@
 
   <script type="text/babel">
     const { useMemo, useState } = React;
-
     const API_ENDPOINT = "/.netlify/functions/create-deeplink";
     const PING_ENDPOINT = "/.netlify/functions/ping";
+
+    const filterUrl = (s) => (s || '').replace(/[^a-zA-Z0-9:\/\?&=._\-]/g, '');
 
     function App() {
       const [pingOk, setPingOk] = useState(null);
       const [inputUrl, setInputUrl] = useState("");
-      const [isComposing, setIsComposing] = useState(false); // 모바일 한글 IME 대응
       const [productName, setProductName] = useState("");
       const [price, setPrice] = useState("");
       const [qty, setQty] = useState("1");
-
       const [loading, setLoading] = useState(false);
       const [apiRaw, setApiRaw] = useState("");
       const [partnerUrl, setPartnerUrl] = useState("");
@@ -83,13 +82,12 @@
           if (!res.ok || data.success === false) {
             throw new Error(data?.error?.message || `HTTP ${res.status}`);
           }
-          // 새 서버(확장본) 기준: deeplink, info.name/price
-          const deeplink = data.deeplink || data.link;
-          const nameFromServer = data.info?.name;
-          const priceFromServer = data.info?.price;
-          if (nameFromServer && !productName) setProductName(nameFromServer);
-          if (Number.isFinite(priceFromServer) && !price) setPrice(String(priceFromServer));
-          setPartnerUrl(deeplink);
+          setPartnerUrl(data.deeplink || data.link);
+
+          if (data.info) {
+            if (data.info.name) setProductName(data.info.name);
+            if (data.info.price) setPrice(String(data.info.price));
+          }
         } catch (e) {
           setError(e?.message || String(e));
         } finally {
@@ -100,24 +98,6 @@
       function copy(text) {
         navigator.clipboard.writeText(text).then(() => alert("복사되었습니다."));
       }
-
-      // ===== 모바일 친화 입력 제어 =====
-      // 링크 칸: 한글/자모 제거 (IME 조합 중엔 방해 X)
-      const filterKorean = (s) => (s || '').replace(/[ㄱ-ㅎㅏ-ㅣ가-힣]/g, '');
-      const handleUrlChange = (e) => {
-        const v = e.target.value;
-        if (isComposing) {
-          setInputUrl(v); // 조합 중에는 그대로 두고
-        } else {
-          setInputUrl(filterKorean(v));
-        }
-      };
-
-      const handleUrlCompositionStart = () => setIsComposing(true);
-      const handleUrlCompositionEnd = (e) => {
-        setIsComposing(false);
-        setInputUrl(filterKorean(e.target.value));
-      };
 
       return (
         <div className="min-h-screen p-5 md:p-10">
@@ -140,33 +120,26 @@
               <div className="grid gap-2">
                 <label className="text-sm text-neutral-600">원본 또는 짧은 링크</label>
                 <input
-                  id="linkInput"
                   value={inputUrl}
-                  onChange={handleUrlChange}
-                  onCompositionStart={handleUrlCompositionStart}
-                  onCompositionEnd={handleUrlCompositionEnd}
+                  onChange={(e) => setInputUrl(filterUrl(e.target.value))}
+                  onCompositionEnd={(e) => setInputUrl(filterUrl(e.target.value))}
                   placeholder="상품 원본 URL 또는 coupa.ng / link.coupang.com"
                   className="w-full rounded-xl border p-3"
-                  inputMode="url"
-                  autoCapitalize="off"
-                  autoCorrect="off"
-                  autoComplete="off"
-                  enterKeyHint="go"
                 />
               </div>
 
               <div className="grid md:grid-cols-3 gap-4">
                 <div className="grid gap-2">
                   <label className="text-sm text-neutral-600">상품명</label>
-                  <input value={productName} onChange={(e) => setProductName(e.target.value)} className="w-full rounded-xl border p-3" autoComplete="off" />
+                  <input value={productName} onChange={(e) => setProductName(e.target.value)} className="w-full rounded-xl border p-3" />
                 </div>
                 <div className="grid gap-2">
                   <label className="text-sm text-neutral-600">가격(원)</label>
-                  <input value={price} onChange={(e) => setPrice(e.target.value.replace(/[^0-9]/g, ""))} className="w-full rounded-xl border p-3" inputMode="numeric" autoComplete="off" />
+                  <input value={price} onChange={(e) => setPrice(e.target.value.replace(/[^0-9]/g, ""))} className="w-full rounded-xl border p-3" />
                 </div>
                 <div className="grid gap-2">
                   <label className="text-sm text-neutral-600">수량</label>
-                  <input value={qty} onChange={(e) => setQty(e.target.value.replace(/[^0-9]/g, ""))} className="w-full rounded-xl border p-3" inputMode="numeric" autoComplete="off" />
+                  <input value={qty} onChange={(e) => setQty(e.target.value.replace(/[^0-9]/g, ""))} className="w-full rounded-xl border p-3" />
                 </div>
               </div>
 
