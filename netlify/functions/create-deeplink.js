@@ -8,34 +8,29 @@ const PATH = "/v2/providers/affiliate_open_api/apis/openapi/v1/deeplink";
 const ACCESS = process.env.COUPANG_ACCESS_KEY;
 const SECRET = process.env.COUPANG_SECRET_KEY;
 
-// ========== 공통 유틸 ==========
+// ===== 유틸 =====
 function utcSignedDate() {
   const d = new Date();
-  const p = (n) => String(n).padStart(2, "0");
+  const p = n => String(n).padStart(2, "0");
   return (
     String(d.getUTCFullYear()).slice(2) +
     p(d.getUTCMonth() + 1) +
-    p(d.getUTCDate()) +
-    "T" +
+    p(d.getUTCDate()) + "T" +
     p(d.getUTCHours()) +
     p(d.getUTCMinutes()) +
-    p(d.getUTCSeconds()) +
-    "Z"
+    p(d.getUTCSeconds()) + "Z"
   );
 }
 
 function buildAuth(method, path, query = "") {
   const datetime = utcSignedDate();
   const message = `${datetime}${method.toUpperCase()}${path}${query}`;
-  const signature = crypto
-    .createHmac("sha256", SECRET)
-    .update(message, "utf8")
-    .digest("hex");
+  const signature = crypto.createHmac("sha256", SECRET).update(message, "utf8").digest("hex");
   const header = `CEA algorithm=HmacSHA256,access-key=${ACCESS},signed-date=${datetime},signature=${signature}`;
   return { header, datetime, message, signature };
 }
 
-// ========== short 링크 해제 ==========
+// ===== short 링크 해제 =====
 async function resolveShortIfNeeded(inputUrl) {
   const isShort = /^https?:\/\/link\.coupang\.com\//i.test(inputUrl);
   if (!isShort) return inputUrl;
@@ -49,11 +44,10 @@ async function resolveShortIfNeeded(inputUrl) {
         timeout: 15000
       })
       .catch((e) => e?.response);
-
     if (!r) break;
+
     const loc = r.headers?.location;
     if (!loc) break;
-
     cur = new URL(loc, cur).toString();
     if (/^https?:\/\/(www\.)?coupang\.com\//i.test(cur)) {
       return cur;
@@ -62,9 +56,11 @@ async function resolveShortIfNeeded(inputUrl) {
   return cur;
 }
 
-// ========== 상품명 / 가격 추출 ==========
+// ===== 상품명/가격 추출 =====
 const UA_MOBILE =
   "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1";
+const UA_DESKTOP =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15";
 
 function extractProductId(url) {
   const m = url.match(/\/products\/(\d+)/);
@@ -72,41 +68,94 @@ function extractProductId(url) {
 }
 
 const withDeadline = (p, ms) =>
-  Promise.race([
-    p,
-    new Promise((_, rej) => setTimeout(() => rej(new Error("TIMEOUT")), ms))
-  ]);
+  Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error("TIMEOUT")), ms))]);
 
-async function fetchProductInfo(productId) {
-  const mobileUrl = `https://m.coupang.com/vp/products/${productId}`;
-  const { data: html } = await axios.get(mobileUrl, {
-    timeout: 12000,
-    headers: { "User-Agent": UA_MOBILE }
-  });
+const toInt = (s) => {
+  if (s == null) return null;
+  const m = String(s).replace(/[^\d]/g, "");
+  return m ? parseInt(m, 10) : null;
+};
 
+function pickNameAndPriceFromHtml(html) {
   let name = null;
-  const og = html.match(/<meta\s+property="og:title"\s+content="([^"]+)"/i);
+  const og = html.match(/<meta\s+property=["']og:title["']\s+content=["']([^"']+)["']/i);
   if (og) name = og[1];
   if (!name) {
-    const m = html.match(/"productName"\s*:\s*"([^"]+)"/i);
-    if (m) name = m[1];
+    const pn = html.match(/"productName"\s*:\s*"([^"]+)"/i);
+    if (pn) name = pn[1];
+  }
+  if (!name) {
+    const tt = html.match(/<title>([^<]+)<\/title>/i);
+    if (tt) name = tt[1];
   }
   if (name) name = name.replace(/\s*\|.*$/, "").trim();
 
-  const prices = [];
-  const rx =
-    /"(salePrice|discountedPrice|discountPrice|originPrice|price|unitPrice|wowPrice)"\s*:\s*(\d{2,})/gi;
-  let mm;
-  while ((mm = rx.exec(html)) !== null) {
-    const v = parseInt(mm[2], 10);
-    if (Number.isFinite(v)) prices.push(v);
+  const nums = [];
+  const jsonPriceKeys =
+    /"(finalPrice|salePrice|discountedPrice|discountPrice|originPrice|price|unitPrice|wowPrice|minPrice|maxPrice|pcPrice|mobilePrice)"\s*:\s*(\d{2,})/gi;
+  let m;
+  while ((m = jsonPriceKeys.exec(html)) !== null) {
+    const v = parseInt(m[2], 10);
+    if (Number.isFinite(v)) nums.push(v);
   }
-  const price = prices.length ? Math.min(...prices) : null;
+  const metaPrice = html.match(/<meta[^>]+property=["']og:product:price:amount["'][^>]+content=["']([^"']+)["']/i);
+  if (metaPrice) nums.push(toInt(metaPrice[1]));
+  const domStrong = html.match(/<span[^>]*class=["'][^"']*(?:total-price|sale|price)[^"']*["'][^>]*>\s*<strong[^>]*>([^<]+)<\/strong>/i);
+  if (domStrong) nums.push(toInt(domStrong[1]));
+  const domPlain = html.match(/<span[^>]*class=["'][^"']*prod-price__price[^"']*["'][^>]*>([^<]+)<\/span>/i);
+  if (domPlain) nums.push(toInt(domPlain[1]));
 
-  return { name, price, productId, source: "mobile" };
+  const priceCandidates = nums.filter(n => Number.isFinite(n) && n > 0);
+  const price = priceCandidates.length ? Math.min(...priceCandidates) : null;
+
+  return { name, price };
 }
 
-// ========== 메인 핸들러 ==========
+async function fetchProductInfo(productId) {
+  try {
+    const mobileUrl = `https://m.coupang.com/vp/products/${productId}`;
+    const { data: mhtml } = await axios.get(mobileUrl, {
+      timeout: 12000,
+      headers: {
+        "User-Agent": UA_MOBILE,
+        "Referer": "https://m.coupang.com/",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7"
+      },
+      responseType: "text"
+    });
+    const { name, price } = pickNameAndPriceFromHtml(mhtml);
+    if (name || price) return { name, price, productId, url: mobileUrl };
+  } catch {}
+
+  const desktopUrl = `https://www.coupang.com/vp/products/${productId}`;
+  const { data: dhtml } = await axios.get(desktopUrl, {
+    timeout: 12000,
+    headers: {
+      "User-Agent": UA_DESKTOP,
+      "Referer": "https://www.coupang.com/",
+      "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7"
+    },
+    responseType: "text"
+  });
+
+  const m = dhtml.match(/<script[^>]+id=["']__NEXT_DATA__["'][^>]*>([\s\S]+?)<\/script>/i);
+  if (m) {
+    try {
+      const next = JSON.parse(m[1]);
+      const raw = JSON.stringify(next);
+      const nameMatch = raw.match(/"productName"\s*:\s*"([^"]+)"/i);
+      const priceMatch = raw.match(/"(finalPrice|salePrice|discountPrice|price)"\s*:\s*(\d{2,})/i);
+      const name = nameMatch ? nameMatch[1].replace(/\s*\|.*$/, "").trim() : null;
+      const price = priceMatch ? parseInt(priceMatch[2], 10) : null;
+      if (name || price) return { name, price, productId, url: desktopUrl };
+    } catch {}
+  }
+
+  const { name, price } = pickNameAndPriceFromHtml(dhtml);
+  return { name, price, productId, url: desktopUrl };
+}
+
+// ===== 메인 핸들러 =====
 exports.handler = async (event) => {
   const qs = event.queryStringParameters || {};
   const debug = qs.debug === "1";
@@ -121,7 +170,6 @@ exports.handler = async (event) => {
     };
   }
 
-  // body 파싱
   let url = "";
   try {
     const body = JSON.parse(event.body || "{}");
@@ -145,7 +193,6 @@ exports.handler = async (event) => {
     };
   }
 
-  // 짧은링크면 원본으로 해제
   let finalUrl;
   try {
     finalUrl = await resolveShortIfNeeded(url);
@@ -154,13 +201,11 @@ exports.handler = async (event) => {
       statusCode: 502,
       body: JSON.stringify({
         success: false,
-        error: { code: "RESOLVE_FAILED", message: String(e?.message || e) },
-        input: { url, finalUrl: null }
+        error: { code: "RESOLVE_FAILED", message: String(e?.message || e) }
       })
     };
   }
 
-  // 쿠팡 상품 URL만 허용
   if (!/^https?:\/\/(www\.)?coupang\.com\//i.test(finalUrl)) {
     return {
       statusCode: 400,
@@ -169,26 +214,20 @@ exports.handler = async (event) => {
         error: {
           code: "INVALID_URL",
           message: "쿠팡 상품 원본 URL로 해제되지 않았습니다."
-        },
-        input: { url, finalUrl }
+        }
       })
     };
   }
 
-  // 상품 정보 추출 (2.5초 제한)
   let info = null;
   const productId = extractProductId(finalUrl);
   if (productId) {
     try {
       info = await withDeadline(fetchProductInfo(productId), 2500);
-    } catch {
-      info = null;
-    }
+    } catch {}
   }
 
-  // 서명 빌드
-  const { header, datetime, message, signature } = buildAuth("POST", PATH, "");
-
+  const { header } = buildAuth("POST", PATH, "");
   try {
     const resp = await axios.post(
       `${HOST}${PATH}`,
@@ -210,12 +249,7 @@ exports.handler = async (event) => {
           success: resp.status === 200 && resp.data?.data?.length > 0,
           upstreamStatus: resp.status,
           upstreamData: resp.data,
-          debug: {
-            datetime,
-            message,
-            signature: signature.slice(0, 16) + "..."
-          },
-          input: { url, finalUrl },
+          input: { url, finalUrl, productId },
           info
         })
       };
@@ -237,7 +271,6 @@ exports.handler = async (event) => {
         reason: "UPSTREAM_ERROR",
         status: resp.status,
         data: resp.data,
-        input: { url, finalUrl },
         info
       })
     };
@@ -250,7 +283,6 @@ exports.handler = async (event) => {
           code: "UPSTREAM_ERROR",
           message: String(e?.response?.data || e.message)
         },
-        input: { url, finalUrl },
         info
       })
     };
