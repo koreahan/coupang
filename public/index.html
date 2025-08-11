@@ -93,11 +93,13 @@ function fmtKRW(n) {
 }
 function setErr(msg){ if(!msg){$("err").style.display="none";} else {$("err").style.display="block";$("err").textContent=msg;} }
 
-// 템플릿 미리보기 전용 정제 로직 추가
 function refreshTpl(){
   let name = $("pname").textContent !== "-" ? $("pname").textContent : "상품명";
-  // 템플릿에만 적용되는 상품명 정제 로직
-  name = name.replace(/\s*-\s*[^|]+\|쿠팡$/, '').trim();
+  // ' - ' 이후의 모든 텍스트를 제거하는 로직으로 수정
+  const hyphenIndex = name.indexOf(' - ');
+  if (hyphenIndex !== -1) {
+    name = name.substring(0, hyphenIndex).trim();
+  }
   const price = $("pprice").textContent !== "-" ? $("pprice").textContent : "가격정보";
   const link = $("deeplink").textContent && !$("deeplink").textContent.startsWith("(")? $("deeplink").textContent : "쿠팡링크";
   $("tpl").textContent = `【쿠팡】${name}
