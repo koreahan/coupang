@@ -54,11 +54,13 @@ function json(obj, code = 200) {
 
 async function normalizeUrl(input) {
   let u = input.trim();
+
   if (u.includes("link.coupang.com")) {
     const r = await fetch(u, { method: "HEAD", redirect: "manual" });
     const loc = r.headers.get("location");
     if (loc) u = loc;
   }
+
   const url = new URL(u);
   [
     "redirect","src","addtag","itime","lptag","wTime","wPcid","wRef","traceid",
@@ -67,6 +69,7 @@ async function normalizeUrl(input) {
     "deviceid","token","contenttype","subid","sig","impressionid","campaigntype",
     "puid","requestid","ctime","contentkeyword","portal","landing_exp","subparam"
   ].forEach(p => url.searchParams.delete(p));
+
   const m = url.pathname.match(/\/(vp\/)?products\/(\d+)/);
   return m ? `https://www.coupang.com/vp/products/${m[2]}` : url.toString();
 }
@@ -120,22 +123,14 @@ function parseInfo(html) {
     const n = s ? Number(s) : NaN;
     return Number.isFinite(n) && n > 0 ? n : null;
   };
-  const push = v => { const n = toNum(v); if (n) prices.push(n); };
-
-  // 1. 단순 패턴 먼저 시도
-  const simplePricePatterns = [
-    /class="salePrice"[^>]*>[\s\S]*?([\d,.]+)<\/span>/gi, // 사용자님 코드와 유사한 단순 패턴
-    /class="price"[^>]*>[\s\S]*?<strong>([\d,.]+)<\/strong>/gi,
-    /data-price="([\d,.]+)"/gi,
-  ];
-  simplePricePatterns.forEach(re => {
-    const m = html.match(re);
-    if (m && m[1]) {
-      push(m[1]);
+  const pushAll = re => {
+    for (const m of html.matchAll(re)) {
+      const n = toNum(m[1]);
+      if (n) prices.push(n);
     }
-  });
+  };
 
-  // 2. JSON-LD 파싱 (1순위)
+  // 1. JSON-LD 파싱
   const ldBlocks = [...html.matchAll(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/g)]
     .map(m => { try { return JSON.parse(m[1]); } catch { return null; } })
     .filter(Boolean)
@@ -154,14 +149,14 @@ function parseInfo(html) {
     });
   }
 
-  // 3. og:title 파싱
+  // 2. og:title 파싱
   const og = html.match(/<meta property="og:title" content="([^"]+)"/) || html.match(/<meta name="title" content="([^"]+)"/);
   if (!title && og?.[1]) {
     title = og[1];
     provider = provider === 'none' ? 'meta' : provider;
   }
 
-  // 4. __NUXT__ 내부 파싱
+  // 3. __NUXT__ 내부 파싱
   const nuxt = html.match(/window\.__NUXT__\s*=\s*(\{[\s\S]*?\});/);
   if (nuxt) try {
     const s = nuxt[1];
@@ -169,12 +164,20 @@ function parseInfo(html) {
         title = s.match(/"productName"\s*:\s*"([^"]+)"/)?.[1]
              || s.match(/"name"\s*:\s*"([^"]+)"/)?.[1] || null;
     }
-    const nuxtPrices = [...s.matchAll(/"(couponPrice|finalPrice|discountedPrice|salePrice|lowPrice|price|totalPrice|optionPrice|dealPrice|memberPrice|cardPrice|instantDiscountPrice)"\s*:\s*("?[\d,\.]+"?)/g)];
-    nuxtPrices.forEach(m => push(m[2]));
+    pushAll(/"(couponPrice|finalPrice|discountedPrice|salePrice|lowPrice|price|totalPrice|optionPrice|dealPrice|memberPrice|cardPrice|instantDiscountPrice)"\s*:\s*("?[\d,\.]+"?)/g);
     provider = provider === 'none' ? '__NUXT__' : provider;
   } catch {}
 
-  // 5. 모든 가격 후보 중 최저가 선택
+  // 4. HTML 전역 후보 파싱
+  const pricePatterns = [
+    /class="total-price[^"]*">[\s\S]*?([\d,.]+)\s*원/gi,
+    /class="prod-price[^"]*">[\s\S]*?([\d,.]+)\s*원/gi,
+    /aria-label="가격\s*([\d,.]+)\s*원"/gi,
+    /data-price="([\d,.]+)"/gi,
+    /data-rt-price="([\d,.]+)"/gi,
+  ];
+  pricePatterns.forEach(pushAll);
+
   const minPrice = prices.length ? Math.min(...prices) : null;
 
   return {
@@ -183,9 +186,4 @@ function parseInfo(html) {
     currency,
     provider
   };
-}
-
-function pickPriceFallback(html) {
-  // 사용자의 원본 pickPriceFallback 함수는 최저가를 찾지 못하므로, 이 함수는 사용하지 않습니다.
-  return null;
 }
