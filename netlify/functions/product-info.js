@@ -8,6 +8,8 @@ const CORS = {
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
+const DEBUG = process.env.DEBUG === "true"; // 필요할 때만 debug 필드 노출
+
 exports.handler = async (event) => {
   try {
     if (event.httpMethod === "OPTIONS") {
@@ -24,14 +26,26 @@ exports.handler = async (event) => {
     const html = await getFastestHtml(finalUrl);
 
     const parsed = parseInfo(html) || {};
-    return json({
+    const payload = {
       success: true,
       finalUrl,
       title: parsed.title ?? null,
       price: parsed.price ?? null,
       currency: parsed.currency ?? "KRW",
       provider: parsed.provider ?? null,
-    });
+    };
+
+    if (DEBUG && !parsed.title && !parsed.price) {
+      payload.debug = {
+        htmlLength: html?.length || 0,
+        hasOg: /<meta property="og:title"/.test(html),
+        ldCount: (html.match(/<script type="application\/ld\+json">/g) || []).length,
+        hasNuxt: /window\.__NUXT__\s*=/.test(html),
+        hasNext: /id="__NEXT_DATA__"/.test(html),
+      };
+    }
+
+    return json(payload);
   } catch (err) {
     return json({ success: false, error: String(err && err.message || err) });
   }
@@ -116,12 +130,12 @@ async function scrapeWithScrapingBee(url, timeoutMs, headers, render = true) {
     forward_headers: "true",
     ...(render ? {
       wait: "networkidle",
-      // JSON‑LD, OG, Next.js, Nuxt 신호 모두
+      // JSON‑LD, OG, Next.js, Nuxt 신호 모두 대기
       wait_for: [
         'meta[property="og:title"]',
         'script[type="application/ld+json"]',
         '#__NEXT_DATA__',
-        'script#__NEXT_DATA__'
+        'script#__NEXT_DATA__',
       ].join(','),
     } : {})
   };
@@ -149,17 +163,37 @@ async function scrapeWithScrapingBee(url, timeoutMs, headers, render = true) {
 
 /* ---------------- 파싱 로직 ---------------- */
 function parseInfo(html) {
-  // 1) JSON‑LD(Product)
-  const ld = [...html.matchAll(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/g)]
+  // 1) JSON‑LD(Product) — 배열/@graph 지원
+  const ldBlocks = [...html.matchAll(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/g)]
     .map(m => { try { return JSON.parse(m[1]); } catch { return null; } })
-    .find(o => o && (o["@type"] === "Product" || o.name));
-  if (ld) {
-    const price = ld?.offers?.price ?? ld?.offers?.lowPrice ?? null;
-    const currency = ld?.offers?.priceCurrency ?? "KRW";
-    if (ld.name) return { title: ld.name, price: price ? String(price) : null, currency, provider: "json-ld" };
+    .filter(Boolean);
+
+  const flatten = (node) => {
+    if (!node) return [];
+    if (Array.isArray(node)) return node.flatMap(flatten);
+    if (node['@graph']) return flatten(node['@graph']);
+    return [node];
+  };
+  const ldFlat = ldBlocks.flatMap(flatten);
+
+  const product = ldFlat.find(o =>
+    (o['@type'] && String(o['@type']).toLowerCase().includes('product')) ||
+    (o.name && (o.offers || o.price || o.brand))
+  );
+
+  if (product) {
+    const title = product.name || product.headline || null;
+    const offers = product.offers && (Array.isArray(product.offers) ? product.offers[0] : product.offers);
+    let price = offers?.price ?? offers?.lowPrice ?? product.price ?? null;
+    if (typeof price === 'string') {
+      const m = price.replace(/[^\d.]/g,'').match(/\d+(?:\.\d+)?/);
+      price = m ? m[0] : null;
+    }
+    const currency = offers?.priceCurrency || product.priceCurrency || 'KRW';
+    if (title || price) return { title: title ?? null, price: price ?? null, currency, provider: 'json-ld' };
   }
 
-  // 2) og:title
+  // 2) OG
   const og = html.match(/<meta property="og:title" content="([^"]+)"/);
   if (og?.[1]) {
     const p = pickPriceFallback(html);
@@ -171,8 +205,10 @@ function parseInfo(html) {
   if (nuxt) try {
     const s = JSON.stringify(JSON.parse(nuxt[1]));
     const price = (s.match(/"salePrice"\s*:\s*(\d+)/)?.[1]) ||
+                  (s.match(/"discountedPrice"\s*:\s*(\d+)/)?.[1]) ||
                   (s.match(/"price"\s*:\s*(\d+)/)?.[1]) || null;
-    const title = (s.match(/"productName"\s*:\s*"([^"]+)"/)?.[1]) || null;
+    const title = (s.match(/"productName"\s*:\s*"([^"]+)"/)?.[1]) ||
+                  (s.match(/"name"\s*:\s*"([^"]+)"/)?.[1]) || null;
     if (title || price) return { title, price, currency: "KRW", provider: "__NUXT__" };
   } catch {}
 
@@ -181,14 +217,12 @@ function parseInfo(html) {
   if (nextTag) {
     try {
       const data = JSON.parse(nextTag[1]);
-      const flat = JSON.stringify(data);
-      const title =
-        (flat.match(/"productName"\s*:\s*"([^"]+)"/)?.[1]) ||
-        (flat.match(/"name"\s*:\s*"([^"]+)"/)?.[1]) || null;
-      const price =
-        (flat.match(/"salePrice"\s*:\s*(\d+)/)?.[1]) ||
-        (flat.match(/"discountedPrice"\s*:\s*(\d+)/)?.[1]) ||
-        (flat.match(/"price"\s*:\s*(\d+)/)?.[1]) || null;
+      const s = JSON.stringify(data);
+      const title = (s.match(/"productName"\s*:\s*"([^"]+)"/)?.[1]) ||
+                    (s.match(/"name"\s*:\s*"([^"]+)"/)?.[1]) || null;
+      const price = (s.match(/"salePrice"\s*:\s*(\d+)/)?.[1]) ||
+                    (s.match(/"discountedPrice"\s*:\s*(\d+)/)?.[1]) ||
+                    (s.match(/"price"\s*:\s*(\d+)/)?.[1]) || null;
       if (title || price) return { title, price, currency: "KRW", provider: "__NEXT_DATA__" };
     } catch {}
   }
@@ -213,11 +247,12 @@ function parseInfo(html) {
 
 function pickPriceFallback(html) {
   const m =
-    html.match(/"salePrice"\s*:\s*(\d+)/) ||
-    html.match(/"discountedPrice"\s*:\s*(\d+)/) ||
-    html.match(/"price"\s*:\s*(\d+)/) ||
-    html.match(/data-price="(\d+)"/);
-  return m?.[1] || null;
+    html.match(/"salePrice"\s*:\s*"?([\d,]+)"?/) ||
+    html.match(/"discountedPrice"\s*:\s*"?([\d,]+)"?/) ||
+    html.match(/"price"\s*:\s*"?([\d,]+)"?/) ||
+    html.match(/data-price="([\d,]+)"/);
+  const v = m?.[1]?.replace(/[^\d]/g,'');
+  return v || null;
 }
 
 function extractTitleTag(html){
