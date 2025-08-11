@@ -81,6 +81,7 @@ pre{white-space:pre-wrap;word-break:break-all;background:#f9fafb;border:1px soli
 const $ = id => document.getElementById(id);
 const ENDPOINT_DEEP = "/.netlify/functions/create-deeplink";
 const ENDPOINT_INFO = "/.netlify/functions/product-info";
+const ENDPOINT_INFO_SLOW = "/.netlify/functions/product-info-slow";
 
 function firstUrl(input) {
   const m = String(input || "").match(/https?:\/\/[^\s]+/i);
@@ -142,20 +143,17 @@ async function createDeeplink(url) {
     return originalLink;
 }
 
-async function fillProductInfo(url) {
+async function fillProductInfo(url, useSlowEndpoint = false) {
     $("pname").textContent = "(조회 중...)";
     $("pprice").textContent = "(조회 중...)";
     
-    const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('상품정보 조회 시간 초과')), 10000));
+    const endpoint = useSlowEndpoint ? ENDPOINT_INFO_SLOW : ENDPOINT_INFO;
     
-    const r = await Promise.race([
-        fetch(ENDPOINT_INFO, {
-            method:"POST",
-            headers:{"Content-Type":"application/json"},
-            body:JSON.stringify({url})
-        }),
-        timeoutPromise
-    ]);
+    const r = await fetch(endpoint, {
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({url})
+    });
     
     const txt = await r.text();
     
@@ -164,7 +162,7 @@ async function fillProductInfo(url) {
     }
 
     const j = JSON.parse(txt);
-    $("raw").textContent += "\n\n--- product-info ---\n" + txt;
+    $("raw").textContent += `\n\n--- product-info (${useSlowEndpoint ? '느린' : '빠른'}) ---\n` + txt;
     
     if(!j.success) {
         throw new Error(j.error || "상품정보 조회 실패");
@@ -178,7 +176,7 @@ async function fillProductInfo(url) {
     $("pprice").textContent = fmtKRW(price);
     
     refreshTpl();
-    return true;
+    return j.price;
 }
 
 $("btnDeep").onclick = async () => {
@@ -199,11 +197,23 @@ $("btnDeep").onclick = async () => {
              throw e;
         });
 
-        await fillProductInfo(originalUrl).catch(e => {
-             setErr(e.message);
-             $("pname").textContent = "(오류 발생)";
-             $("pprice").textContent = "(오류 발생)";
-        });
+        // 1단계: 빠른 조회 시도
+        let price = null;
+        try {
+            price = await fillProductInfo(originalUrl, false);
+        } catch(e) {
+            console.error('빠른 조회 실패, 느린 조회로 재시도합니다.');
+            setErr("가격 조회 실패, 느린 방법으로 재시도합니다...");
+        }
+
+        // 2단계: 가격을 찾지 못했거나 실패했다면 느린 조회 시도
+        if (price === null) {
+            await fillProductInfo(originalUrl, true).catch(e => {
+                setErr(e.message);
+                $("pname").textContent = "(오류 발생)";
+                $("pprice").textContent = "(오류 발생)";
+            });
+        }
 
     }catch(e){ 
         // 전역 오류 처리
@@ -219,7 +229,7 @@ $("btnInfo").onclick = async () => {
         const url = firstUrl($("inp").value);
         if(!url){ setErr("쿠팡 링크를 입력하세요."); return; }
         
-        await fillProductInfo(url);
+        await fillProductInfo(url, true);
     }catch(e){ 
         setErr(e.message); 
     }finally{ 
