@@ -111,7 +111,6 @@ async function scrapeWithScrapingBee(url, options) {
   return res.text();
 }
 
-// HTML 파싱 (최저가 검색 로직 보강)
 function parseInfo(html) {
   const prices = [];
   let title = null, currency = "KRW", provider = "none";
@@ -127,7 +126,6 @@ function parseInfo(html) {
     }
   };
 
-  // 1. JSON-LD 파싱
   const ldBlocks = [...html.matchAll(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/g)]
     .map(m => { try { return JSON.parse(m[1]); } catch { return null; } })
     .filter(Boolean)
@@ -146,14 +144,12 @@ function parseInfo(html) {
     });
   }
 
-  // 2. og:title 파싱
   const og = html.match(/<meta property="og:title" content="([^"]+)"/) || html.match(/<meta name="title" content="([^"]+)"/);
   if (!title && og?.[1]) {
     title = og[1];
     provider = provider === 'none' ? 'meta' : provider;
   }
 
-  // 3. __NUXT__ 내부 파싱
   const nuxt = html.match(/window\.__NUXT__\s*=\s*(\{[\s\S]*?\});/);
   if (nuxt) try {
     const s = nuxt[1];
@@ -165,23 +161,15 @@ function parseInfo(html) {
     provider = provider === 'none' ? '__NUXT__' : provider;
   } catch {}
 
-  // 4. HTML 전역 후보 파싱
   const pricePatterns = [
     /class="total-price[^"]*">[\s\S]*?([\d,.]+)\s*원/gi,
     /class="prod-price[^"]*">[\s\S]*?([\d,.]+)\s*원/gi,
     /aria-label="가격\s*([\d,.]+)\s*원"/gi,
     /data-price="([\d,.]+)"/gi,
     /data-rt-price="([\d,.]+)"/gi,
-    /id="priceValue"[\s\S]*?([\d,.]+)/gi, // 새로운 패턴 추가
+    /id="priceValue"[\s\S]*?([\d,.]+)/gi,
   ];
   pricePatterns.forEach(pushAll);
-
   const minPrice = prices.length ? Math.min(...prices) : null;
-
-  return {
-    title,
-    price: minPrice != null ? String(minPrice) : null,
-    currency,
-    provider
-  };
+  return { title, price: minPrice != null ? String(minPrice) : null, currency, provider };
 }
