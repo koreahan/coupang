@@ -20,6 +20,17 @@ input[type=text]{width:100%;padding:14px;border:1px solid #e5e7eb;border-radius:
 .error{color:#b00020;background:#fff1f1;border:1px solid #f3c2c2;padding:10px 12px;border-radius:10px;font-size:13px}
 pre{white-space:pre-wrap;word-break:break-all;background:#f9fafb;border:1px solid #e5e7eb;border-radius:12px;padding:12px;font-size:12px;max-height:320px;overflow:auto}
 .muted{color:#666;font-size:12px}
+
+/* ---- 버튼 활성화/비활성화 시 스타일 추가 ---- */
+.btn:disabled {
+    background: #ccc;
+    cursor: not-allowed;
+}
+.btn.secondary:disabled {
+    background: #f6f7f9;
+    color: #666;
+    border-color: #e5e7eb;
+}
 </style>
 </head>
 <body>
@@ -154,10 +165,21 @@ $("btnDeep").onclick = async () => {
         const url = firstUrl($("inp").value);
         if(!url){ setErr("쿠팡 링크를 입력하세요."); return; }
         
+        // 버튼을 누르면 '생성 중...' 메시지가 즉시 표시되도록 수정
         $("deeplink").textContent="(생성 중...)";
+        $("pname").textContent="(조회 중...)";
+        $("pprice").textContent="(조회 중...)";
+
         await Promise.all([
-            createDeeplink(url).catch(e => setErr(e.message)),
-            fillProductInfo(url).catch(e => setErr(e.message))
+            createDeeplink(url).catch(e => {
+                setErr(e.message);
+                $("deeplink").textContent = "(오류 발생)";
+            }),
+            fillProductInfo(url).catch(e => {
+                setErr(e.message);
+                $("pname").textContent = "-";
+                $("pprice").textContent = "-";
+            })
         ]);
     }catch(e){ 
         setErr(e.message);
@@ -173,6 +195,9 @@ $("btnInfo").onclick = async () => {
         const url = firstUrl($("inp").value);
         if(!url){ setErr("쿠팡 링크를 입력하세요."); return; }
         
+        $("pname").textContent="(조회 중...)";
+        $("pprice").textContent="(조회 중...)";
+
         await fillProductInfo(url);
     }catch(e){ 
         setErr(e.message); 
@@ -207,4 +232,3 @@ refreshTpl();
 </script>
 </body>
 </html>
-
