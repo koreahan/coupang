@@ -1,81 +1,201 @@
 <!DOCTYPE html>
 <html lang="ko">
 <head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>쿠팡 딥링크 생성기</title>
-<style>
-  body { font-family: Arial, sans-serif; margin: 20px; }
-  input, button { padding: 8px; margin: 4px 0; }
-  .card { border: 1px solid #ccc; border-radius: 8px; padding: 16px; margin-bottom: 20px; }
-  pre { background: #f9f9f9; padding: 10px; border-radius: 4px; }
-</style>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>쿠팡 파트너스 딥링크 · 템플릿</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 </head>
-<body>
-<h1>쿠팡 파트너스 딥링크 생성</h1>
+<body class="bg-neutral-50">
+  <div id="root"></div>
 
-<div class="card">
-  <label>원본 또는 짧은 링크<br>
-    <input id="url" style="width:100%" placeholder="https://link.coupang.com/...">
-  </label><br>
-  <label>상품명<br>
-    <input id="name" style="width:100%" placeholder="상품명">
-  </label><br>
-  <label>가격(원)<br>
-    <input id="price" style="width:100%" placeholder="12000">
-  </label><br>
-  <label>수량<br>
-    <input id="qty" style="width:100%" placeholder="1">
-  </label><br>
-  <button onclick="createLink()">딥링크 생성</button>
-</div>
+  <script type="text/babel">
+    const { useMemo, useState } = React;
 
-<div class="card">
-  <h3>파트너스 링크</h3>
-  <div id="partnerUrl">(아직 없음)</div>
-</div>
+    const API_ENDPOINT = "/.netlify/functions/create-deeplink"; // 딥링크: 기존 로직 그대로
+    const PRODUCT_INFO_ENDPOINT = "/.netlify/functions/product-info?fast=1"; // 이름/가격: 서버에서
 
-<div class="card">
-  <h3>템플릿 미리보기</h3>
-  <pre id="templatePreview"></pre>
-  <button onclick="copyTemplate()">템플릿 복사</button>
-</div>
+    // 입력 중엔 한/특문 걸러주기(붙여넣기 자유)
+    const filterUrl = (s) => (s || '').replace(/[^a-zA-Z0-9:\/?&=._-]/g, '');
+    // 문장 속 첫 http(s)만 추출
+    const extractFirstUrl = (s) => {
+      const m = String(s || '').match(/https?:\/\/[^\s]+/);
+      return m ? m[0] : '';
+    };
 
-<div class="card">
-  <h3>API 응답</h3>
-  <pre id="apiResponse"></pre>
-</div>
+    function App() {
+      const [inputUrl, setInputUrl] = useState("");
+      const [isComposing, setIsComposing] = useState(false);
 
-<script>
-async function createLink() {
-  const url = document.getElementById("url").value.trim();
-  const name = document.getElementById("name").value.trim();
-  const price = document.getElementById("price").value.trim();
-  const qty = document.getElementById("qty").value.trim() || "1";
+      // 자동 채움 값(수정 불가)
+      const [productName, setProductName] = useState("");
+      const [price, setPrice] = useState(""); // 숫자 문자열
+      const [partnerUrl, setPartnerUrl] = useState("");
 
-  const res = await fetch("/.netlify/functions/create-deeplink", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ url })
-  });
-  const data = await res.json();
-  document.getElementById("apiResponse").textContent = JSON.stringify(data, null, 2);
+      const [loading, setLoading] = useState(false);
+      const [apiRaw, setApiRaw] = useState("");
+      const [error, setError] = useState("");
 
-  if (data.success) {
-    document.getElementById("partnerUrl").textContent = data.link;
-    const formattedPrice = price ? new Intl.NumberFormat("ko-KR").format(Number(price)) + "원" : "가격정보";
-    const template = `【쿠팡】${name || "상품명"}\n가격: ${formattedPrice}\n링크: ${data.link}\n\n※ 모든 핫딜은 카드 할인 및 쿠폰 적용가 기준입니다.\n※ 이 포스팅은 쿠팡파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받습니다. 구입 시 제품 가격에는 아무런 영향이 없습니다.`;
-    document.getElementById("templatePreview").textContent = template;
-  } else {
-    document.getElementById("partnerUrl").textContent = "(생성 실패)";
-    document.getElementById("templatePreview").textContent = "";
-  }
-}
+      const formatted = (v) => new Intl.NumberFormat("ko-KR").format(Number(v || 0));
 
-function copyTemplate() {
-  const text = document.getElementById("templatePreview").textContent;
-  navigator.clipboard.writeText(text).then(() => alert("복사 완료"));
-}
-</script>
+      const fixedTemplate = useMemo(() => {
+        const safeName = productName || "상품명";
+        const safePrice = price ? formatted(price) + "원" : "가격정보";
+        const link = partnerUrl || "쿠팡링크";
+        return `【쿠팡】${safeName}
+가격: ${safePrice}
+링크: ${link}
+
+※ 모든 핫딜은 카드 할인 및 쿠폰 적용가 기준입니다.
+※ 이 포스팅은 쿠팡파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받습니다. 구입 시 제품 가격에는 아무런 영향이 없습니다.`;
+      }, [productName, price, partnerUrl]);
+
+      async function createDeeplink() {
+        setLoading(true);
+        setError("");
+        setApiRaw("");
+        setPartnerUrl("");
+
+        const cleanUrl = extractFirstUrl(inputUrl);
+        if (!cleanUrl) {
+          setLoading(false);
+          setError("쿠팡 상품 링크를 입력하세요.");
+          return;
+        }
+
+        try {
+          // 1) 딥링크 먼저 (원본 로직 유지)
+          const deepRes = await fetch(API_ENDPOINT, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ url: cleanUrl })
+          });
+          const deepText = await deepRes.text();
+          setApiRaw(deepText);
+          const deep = JSON.parse(deepText);
+
+          if (!deepRes.ok || deep.success === false) {
+            throw new Error(deep?.error?.message || deep?.reason || `HTTP ${deepRes.status}`);
+          }
+
+          const deeplink = deep.deeplink || deep.link;
+          setPartnerUrl(deeplink);
+
+          // 2) 상품명/가격 자동 채움(수정 불가) — originalUrl 있으면 그걸로 빠르게
+          const original = deep?.raw?.data?.[0]?.originalUrl || cleanUrl;
+
+          // 3초 타임아웃으로 느리면 포기 (딥링크는 이미 준비됨)
+          const withTimeout = (p, ms=3000) => Promise.race([p, new Promise((_, rej)=>setTimeout(()=>rej(new Error("TIMEOUT")), ms))]);
+
+          withTimeout(
+            fetch(PRODUCT_INFO_ENDPOINT, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ url: original })
+            }).then(r => r.json()),
+            3000
+          ).then(j => {
+            if (j?.success) {
+              if (j.info?.name) setProductName(j.info.name);
+              if (Number.isFinite(j.info?.price)) setPrice(String(j.info.price));
+            }
+          }).catch(() => { /* 느리면 무시 */ });
+
+        } catch (e) {
+          setError(e?.message || String(e));
+        } finally {
+          setLoading(false);
+        }
+      }
+
+      function copy(text) {
+        navigator.clipboard.writeText(text).then(() => alert("복사되었습니다."));
+      }
+
+      // 모바일 IME 대응 + URL 필터
+      const handleUrlChange = (e) => {
+        const v = e.target.value;
+        setInputUrl(isComposing ? v : filterUrl(v));
+      };
+      const handleUrlCompositionStart = () => setIsComposing(true);
+      const handleUrlCompositionEnd = (e) => {
+        setIsComposing(false);
+        setInputUrl(filterUrl(e.target.value));
+      };
+
+      return (
+        <div className="min-h-screen p-4 sm:p-6">
+          <div className="max-w-xl mx-auto grid gap-5">
+            <h1 className="text-2xl sm:text-3xl font-semibold">쿠팡 파트너스 딥링크 생성 · 템플릿</h1>
+
+            <div className="rounded-2xl bg-white shadow p-4 grid gap-4">
+              <div className="grid gap-2">
+                <label className="text-sm text-neutral-600">원본 또는 짧은 링크</label>
+                <input
+                  value={inputUrl}
+                  onChange={handleUrlChange}
+                  onCompositionStart={handleUrlCompositionStart}
+                  onCompositionEnd={handleUrlCompositionEnd}
+                  placeholder="문장 전체 붙여넣기 OK · 첫 번째 http(s) URL만 자동 인식"
+                  className="w-full rounded-xl border p-4 text-base"
+                  inputMode="url"
+                  autoCapitalize="off"
+                  autoCorrect="off"
+                  autoComplete="off"
+                  enterKeyHint="go"
+                />
+              </div>
+
+              <!-- 상품명/가격: 수정 불가 표시용 -->
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div className="grid gap-2">
+                  <label className="text-sm text-neutral-600">상품명 (자동)</label>
+                  <div className="w-full rounded-xl border p-4 text-base bg-neutral-50 select-text">
+                    {productName || <span className="text-neutral-400">딥링크 생성 후 자동 채움</span>}
+                  </div>
+                </div>
+                <div className="grid gap-2">
+                  <label className="text-sm text-neutral-600">가격(원, 자동)</label>
+                  <div className="w-full rounded-xl border p-4 text-base bg-neutral-50 select-text">
+                    {price ? formatted(price) + "원" : <span className="text-neutral-400">딥링크 생성 후 자동 채움</span>}
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-3">
+                <button disabled={loading || !inputUrl.trim()} onClick={createDeeplink} className="px-5 py-3 rounded-xl shadow bg-black text-white text-sm sm:text-base disabled:opacity-40 active:scale-[.98]">
+                  {loading ? "생성 중..." : "딥링크 생성"}
+                </button>
+                <button onClick={() => copy(fixedTemplate)} className="px-5 py-3 rounded-xl shadow border text-sm sm:text-base active:scale-[.98]">
+                  템플릿 복사
+                </button>
+              </div>
+
+              {error && <div className="text-sm sm:text-base text-red-600 bg-red-50 border border-red-200 rounded-xl p-3">{error}</div>}
+            </div>
+
+            <div className="rounded-2xl bg-white shadow p-4 grid gap-3">
+              <div className="flex items-center justify-between">
+                <div className="text-sm text-neutral-500">파트너스 링크</div>
+                {partnerUrl && <button onClick={() => copy(partnerUrl)} className="px-3 py-2 rounded-lg shadow border text-xs sm:text-sm">링크 복사</button>}
+              </div>
+              <div className="text-sm sm:text-base break-all select-all min-h-[24px]">{partnerUrl || "(아직 생성되지 않았습니다)"}</div>
+            </div>
+
+            <details className="rounded-2xl bg-white shadow p-4">
+              <summary className="cursor-pointer select-none text-sm text-neutral-500">API 원본 응답(JSON)</summary>
+              <pre className="mt-3 whitespace-pre-wrap text-xs sm:text-sm break-all bg-neutral-50 p-3 rounded-xl border">{apiRaw || "(응답 없음)"}</pre>
+            </details>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<App />);
+  </script>
 </body>
 </html>
