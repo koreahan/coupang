@@ -1,6 +1,6 @@
 // netlify/functions/product-info.js
 // Node 18+ (fetch 내장). Netlify v1 handler.
-// ScrapingBee 병렬 시도 + URL 정규화 + 견고한 파싱 + 디버그 친화 에러.
+// ScrapingBee 병렬 시도 + 데스크톱/모바일 URL 동시 시도 + 견고한 파싱 + 400 방지 + 디버그.
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -8,7 +8,7 @@ const CORS = {
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
-const DEBUG = process.env.DEBUG === "true"; // 필요할 때만 debug 필드 노출
+const DEBUG = process.env.DEBUG === "true"; // DEBUG=true 시 파싱실패 디버그 필드 포함
 
 exports.handler = async (event) => {
   try {
@@ -63,7 +63,7 @@ function json(obj, code = 200) {
 async function normalizeUrl(input) {
   let u = input.trim();
 
-  // 쿠팡 파트너스 짧은링크는 서버에서 해제(프론트 CORS 회피)
+  // 쿠팡 파트너스 짧은링크 서버에서 해제
   if (u.includes("link.coupang.com")) {
     const r = await fetch(u, { method: "HEAD", redirect: "manual" });
     const loc = r.headers.get("location");
@@ -80,16 +80,25 @@ async function normalizeUrl(input) {
   ].forEach(p => url.searchParams.delete(p));
 
   const m = url.pathname.match(/\/(vp\/)?products\/(\d+)/);
-  return m ? `https://www.coupang.com/vp/products/${m[2]}` : url.toString();
+  const desktop = m ? `https://www.coupang.com/vp/products/${m[2]}` : url.toString();
+  const mobile  = m ? `https://m.coupang.com/vp/products/${m[2]}` : desktop;
+
+  return { desktop, mobile, id: m ? m[2] : null, toString(){ return desktop; } };
 }
 
-/* ---------------- 병렬 시도(가장 빠른 것만 채택) ---------------- */
-async function getFastestHtml(finalUrl) {
+/* ---------------- 병렬 시도(데스크톱+모바일) ---------------- */
+async function getFastestHtml(finalUrlObj) {
+  const { desktop, mobile } = typeof finalUrlObj === 'string'
+    ? { desktop: finalUrlObj, mobile: toMobile(finalUrlObj) }
+    : finalUrlObj;
+
   const attempts = [
-    // 렌더링(데스크톱/모바일) 8s, 비렌더 2.5s
-    () => scrapeWithScrapingBee(finalUrl, 8000, desktopHeaders(), true),
-    () => scrapeWithScrapingBee(finalUrl, 8000, mobileHeaders(), true),
-    () => scrapeWithScrapingBee(finalUrl, 2500, desktopHeaders(), false),
+    // 데스크톱 렌더링/비렌더
+    () => scrapeWithScrapingBee(desktop, 9000, desktopHeaders(), true),
+    () => scrapeWithScrapingBee(desktop, 2800, desktopHeaders(), false),
+    // 모바일 렌더링/비렌더 (모바일이 더 잘 뜨는 상품 존재)
+    () => scrapeWithScrapingBee(mobile, 9000, mobileHeaders(), true),
+    () => scrapeWithScrapingBee(mobile, 2800, mobileHeaders(), false),
   ];
 
   const results = await Promise.allSettled(attempts.map(fn => fn()));
@@ -98,6 +107,14 @@ async function getFastestHtml(finalUrl) {
 
   const reasons = results.filter(r => r.status === "rejected").map(r => String(r.reason));
   throw new Error("All attempts failed: " + reasons.join(" | "));
+}
+
+function toMobile(desktopUrl) {
+  try {
+    const u = new URL(desktopUrl);
+    u.hostname = "m.coupang.com";
+    return u.toString();
+  } catch { return desktopUrl; }
 }
 
 function desktopHeaders() {
@@ -120,7 +137,7 @@ async function scrapeWithScrapingBee(url, timeoutMs, headers, render = true) {
   const apiKey = process.env.SCRAPINGBEE_KEY;
   if (!apiKey) throw new Error("Missing SCRAPINGBEE_KEY");
 
-  // 빈 값 전송 금지(400 예방) + 렌더링 시에만 wait/selector
+  // 빈 값 전송 금지(400 방지) + 렌더링 시에만 wait/selector
   const params = {
     api_key: apiKey,
     url,
@@ -130,13 +147,13 @@ async function scrapeWithScrapingBee(url, timeoutMs, headers, render = true) {
     forward_headers: "true",
     ...(render ? {
       wait: "networkidle",
-      // JSON‑LD, OG, Next.js, Nuxt 신호 모두 대기
       wait_for: [
         'meta[property="og:title"]',
         'script[type="application/ld+json"]',
         '#__NEXT_DATA__',
         'script#__NEXT_DATA__',
       ].join(','),
+      js_scenario: 'return true;', // 렌더 안정화용 no-op
     } : {})
   };
 
@@ -161,7 +178,7 @@ async function scrapeWithScrapingBee(url, timeoutMs, headers, render = true) {
   return res.text();
 }
 
-/* ---------------- 파싱 로직 ---------------- */
+/* ---------------- 파싱 로직(강화판) ---------------- */
 function parseInfo(html) {
   // 1) JSON‑LD(Product) — 배열/@graph 지원
   const ldBlocks = [...html.matchAll(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/g)]
@@ -204,12 +221,14 @@ function parseInfo(html) {
   const nuxt = html.match(/window\.__NUXT__\s*=\s*(\{[\s\S]*?\});/);
   if (nuxt) try {
     const s = JSON.stringify(JSON.parse(nuxt[1]));
-    const price = (s.match(/"salePrice"\s*:\s*(\d+)/)?.[1]) ||
-                  (s.match(/"discountedPrice"\s*:\s*(\d+)/)?.[1]) ||
-                  (s.match(/"price"\s*:\s*(\d+)/)?.[1]) || null;
+    const price = (s.match(/"salePrice"\s*:\s*"?([\d,]+)"?/)?.[1]) ||
+                  (s.match(/"discountedPrice"\s*:\s*"?([\d,]+)"?/)?.[1]) ||
+                  (s.match(/"price"\s*:\s*"?([\d,]+)"?/)?.[1]) || null;
     const title = (s.match(/"productName"\s*:\s*"([^"]+)"/)?.[1]) ||
+                  (s.match(/"displayProductName"\s*:\s*"([^"]+)"/)?.[1]) ||
                   (s.match(/"name"\s*:\s*"([^"]+)"/)?.[1]) || null;
-    if (title || price) return { title, price, currency: "KRW", provider: "__NUXT__" };
+    const normPrice = price ? price.replace(/[^\d]/g,'') : null;
+    if (title || normPrice) return { title, price: normPrice, currency: "KRW", provider: "__NUXT__" };
   } catch {}
 
   // 4) __NEXT_DATA__ (Next.js)
@@ -219,24 +238,52 @@ function parseInfo(html) {
       const data = JSON.parse(nextTag[1]);
       const s = JSON.stringify(data);
       const title = (s.match(/"productName"\s*:\s*"([^"]+)"/)?.[1]) ||
+                    (s.match(/"displayProductName"\s*:\s*"([^"]+)"/)?.[1]) ||
                     (s.match(/"name"\s*:\s*"([^"]+)"/)?.[1]) || null;
-      const price = (s.match(/"salePrice"\s*:\s*(\d+)/)?.[1]) ||
-                    (s.match(/"discountedPrice"\s*:\s*(\d+)/)?.[1]) ||
-                    (s.match(/"price"\s*:\s*(\d+)/)?.[1]) || null;
-      if (title || price) return { title, price, currency: "KRW", provider: "__NEXT_DATA__" };
+      const price = (s.match(/"priceSales"\s*:\s*"?([\d,]+)"?/)?.[1]) ||
+                    (s.match(/"salePrice"\s*:\s*"?([\d,]+)"?/)?.[1]) ||
+                    (s.match(/"discountedPrice"\s*:\s*"?([\d,]+)"?/)?.[1]) ||
+                    (s.match(/"buyPrice"\s*:\s*"?([\d,]+)"?/)?.[1]) ||
+                    (s.match(/"price"\s*:\s*"?([\d,]+)"?/)?.[1]) || null;
+      const normPrice = price ? price.replace(/[^\d]/g,'') : null;
+      if (title || normPrice) return { title, price: normPrice, currency: "KRW", provider: "__NEXT_DATA__" };
     } catch {}
   }
 
   // 5) meta price 백업
   const metaPrice =
-    html.match(/<meta[^>]+itemprop="price"[^>]+content="(\d+)"/) ||
-    html.match(/<meta[^>]+property="product:price:amount"[^>]+content="(\d+)"/);
+    html.match(/<meta[^>]+itemprop="price"[^>]+content="([\d,]+)"/) ||
+    html.match(/<meta[^>]+property="product:price:amount"[^>]+content="([\d,]+)"/);
   if (metaPrice?.[1]) {
     const t = og?.[1] || extractTitleTag(html);
-    return { title: t || null, price: metaPrice[1], currency: "KRW", provider: "meta" };
+    return { title: t || null, price: metaPrice[1].replace(/[^\d]/g,''), currency: "KRW", provider: "meta" };
   }
 
-  // 6) <title> 백업
+  // 6) 흔한 일반 키(백업)
+  const genericTitle =
+    html.match(/"displayProductName"\s*:\s*"([^"]+)"/)?.[1] ||
+    html.match(/"productName"\s*:\s*"([^"]+)"/)?.[1] ||
+    html.match(/"name"\s*:\s*"([^"]+)"/)?.[1] ||
+    null;
+
+  const genericPrice =
+    html.match(/"priceSales"\s*:\s*"?([\d,]+)"?/)?.[1] ||
+    html.match(/"buyPrice"\s*:\s*"?([\d,]+)"?/)?.[1] ||
+    html.match(/"salePrice"\s*:\s*"?([\d,]+)"?/)?.[1] ||
+    html.match(/"price"\s*:\s*"?([\d,]+)"?/)?.[1] ||
+    html.match(/data-price="([\d,]+)"/)?.[1] ||
+    null;
+
+  if (genericTitle || genericPrice) {
+    return {
+      title: genericTitle || null,
+      price: genericPrice ? genericPrice.replace(/[^\d]/g,'') : null,
+      currency: "KRW",
+      provider: "generic"
+    };
+  }
+
+  // 7) <title> 최종 백업
   const ttl = extractTitleTag(html);
   if (ttl) {
     return { title: ttl, price: pickPriceFallback(html), currency: "KRW", provider: "title" };
@@ -247,8 +294,10 @@ function parseInfo(html) {
 
 function pickPriceFallback(html) {
   const m =
-    html.match(/"salePrice"\s*:\s*"?([\d,]+)"?/) ||
+    html.match(/"priceSales"\s*:\s*"?([\d,]+)"?/) ||
     html.match(/"discountedPrice"\s*:\s*"?([\d,]+)"?/) ||
+    html.match(/"salePrice"\s*:\s*"?([\d,]+)"?/) ||
+    html.match(/"buyPrice"\s*:\s*"?([\d,]+)"?/) ||
     html.match(/"price"\s*:\s*"?([\d,]+)"?/) ||
     html.match(/data-price="([\d,]+)"/);
   const v = m?.[1]?.replace(/[^\d]/g,'');
@@ -259,7 +308,6 @@ function extractTitleTag(html){
   const m = html.match(/<title>([\s\S]*?)<\/title>/i);
   if (!m) return null;
   let t = m[1].replace(/\s+/g,' ').trim();
-  // 쿠팡 접두/접미어 정리
   t = t.replace(/\|?\s*쿠팡!?/g,'').replace(/:\s*로켓배송.*$/,'').trim();
   return t || null;
 }
