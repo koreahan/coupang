@@ -123,6 +123,8 @@ function parseInfo(html){
       /aria-label="가격\s*([\d,.]+)\s*원"/gi,
       /data-price="([\d,.]+)"/gi,
       /data-rt-price="([\d,.]+)"/gi,
+      /class="price">[\s\S]*?<strong>([\d,.]+)<\/strong>원/gi,
+      /content="product:price:amount"[\s\S]*?content="([\d,.]+)"/gi,
     ];
     if (prices.length === 0) {
       const fallbackPrices = new Set();
