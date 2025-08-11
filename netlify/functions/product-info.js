@@ -1,6 +1,7 @@
 // netlify/functions/product-info.js
 // Netlify Function v1 (Node 18+)
-// 쿠팡 상품명/최저가 추출 — 8초 예산, 렌더 우선, 순차 시도, Next.js/NUXT 지원
+// 쿠팡 상품명/최저가 추출 — 8초 예산, 순차 시도(비렌더→비렌더→렌더→직접), NUXT/NEXT 지원
+
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
@@ -15,12 +16,12 @@ exports.handler = async (event) => {
     const { url } = JSON.parse(event.body || "{}");
     if (!url) return json({ success:false, error:"No URL provided" }, 400);
 
-    // === 8s budget (Netlify 10s 한도 안전권) ===
+    // === 8s budget (Netlify 10s 아래) ===
     const T0 = Date.now(), BUDGET = 8000;
     const left = () => Math.max(0, BUDGET - (Date.now() - T0));
 
     const finalUrl = await normalizeUrl(url);
-    const html = await getHtml(finalUrl, left); // 예산 내 렌더/비렌더 순차 시도
+    const html = await getHtml(finalUrl, left); // 예산 내에서 순차 시도
 
     const parsed = parseInfo(html) || { title:null, prices:[], currency:"KRW", provider:"none" };
     const fallback = pickPriceFallback(html);
@@ -32,7 +33,7 @@ exports.handler = async (event) => {
       success: true,
       finalUrl,
       title: parsed.title ?? null,
-      price: minPrice ?? null,           // 숫자 KRW
+      price: minPrice ?? null,      // 숫자(KRW)
       currency: parsed.currency ?? "KRW",
       provider: parsed.provider ?? null
     });
@@ -73,7 +74,7 @@ async function normalizeUrl(input){
   return out.toString();
 }
 
-// ---------- ScrapingBee (렌더 우선·순차 시도·짧은 재시도, 8초 예산 준수) ----------
+// ---------- HTML 가져오기 (비렌더→비렌더→렌더→직접) ----------
 const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
 function desktopHeaders(){ return {
   "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
@@ -86,31 +87,17 @@ function mobileHeaders(){ return {
 
 async function getHtml(finalUrl, left){
   const steps = [
-    { h: desktopHeaders(), render:true,  ms:3600 }, // 렌더 먼저(제목/가격 대기 지표 확장)
-    { h: mobileHeaders(),  render:false, ms:1200 },
-    { h: desktopHeaders(), render:false, ms:1200 },
+    { fn:()=>bee(finalUrl, Math.min(1200, Math.max(600, left()-200)), desktopHeaders(), false) },
+    { fn:()=>bee(finalUrl, Math.min(1200, Math.max(600, left()-200)), mobileHeaders(),  false) },
+    { fn:()=>bee(finalUrl, Math.min(2000, Math.max(600, left()-200)), desktopHeaders(), true ) },
+    { fn:()=>direct(finalUrl, Math.min(1200, Math.max(600, left()-200)), desktopHeaders())    }, // 최후의 보루
   ];
-  let lastErr;
+  let last;
   for (const s of steps){
     if (left() < 500) break;
-    const to = Math.min(s.ms, Math.max(600, left()-200));
-    try { return await beeWithRetry(finalUrl, to, s.h, s.render, left); }
-    catch(e){ lastErr = e; }
+    try { return await s.fn(); } catch(e){ last = e; }
   }
-  throw lastErr || new Error("aborted: budget");
-}
-
-async function beeWithRetry(url, timeoutMs, headers, render, left){
-  const delays = [250]; // 1회만 짧게 재시도
-  for (let i=0; i<=delays.length; i++){
-    if (left() < 400) throw new Error("aborted: low budget");
-    try { return await bee(url, timeoutMs, headers, render); }
-    catch(e){
-      const s = Number((/ScrapingBee\s+(\d+)/.exec(String(e.message))||[])[1]||0);
-      if (!(s===429 || (s>=500&&s<600)) || i===delays.length) throw e;
-      await sleep(delays[i]);
-    }
-  }
+  throw last || new Error("aborted: budget");
 }
 
 async function bee(url, timeoutMs, headers, render=true){
@@ -122,11 +109,10 @@ async function bee(url, timeoutMs, headers, render=true){
     render_js: render ? "true" : "false",
     country_code: "kr",
     ...(render ? {
-      // Nuxt/Next/OG/DOM 중 하나라도 잡히게 대기
       wait_for: 'meta[property="og:title"], script[type="application/ld+json"], script[id="__NEXT_DATA__"], #__nuxt, #__next, .prod-buy-header__title'
     } : {}),
     ...(process.env.SCRAPINGBEE_PREMIUM === "1" ? { premium_proxy:"true" } : {}),
-    // forward_headers: "true", // 특별히 필요 없으면 비활성 권장(안정성↑)
+    // forward_headers 비활성 권장
   };
   const qs = new URLSearchParams(params);
 
@@ -136,8 +122,25 @@ async function bee(url, timeoutMs, headers, render=true){
     const res = await fetch(`https://app.scrapingbee.com/api/v1?${qs}`, { method:"GET", headers, signal: ctrl.signal });
     if (!res.ok){
       const body = await res.text().catch(()=> "");
+      // 429/5xx 한 번만 짧게 재시도
+      const code = Number((/^\D*(\d{3})/.exec(body)||[])[1]||res.status);
+      if (code===429 || (code>=500 && code<600)) {
+        clearTimeout(t); await sleep(250);
+        return await bee(url, timeoutMs, headers, render);
+      }
       throw new Error(`ScrapingBee ${res.status} ${body.slice(0,180)}`);
     }
+    return await res.text();
+  } finally { clearTimeout(t); }
+}
+
+// Bee 실패 시 직접 가져오기(서버사이드라 CORS 무관)
+async function direct(url, timeoutMs, headers){
+  const ctrl = new AbortController();
+  const t = setTimeout(()=>ctrl.abort(), timeoutMs);
+  try{
+    const res = await fetch(url, { headers, signal: ctrl.signal });
+    if (!res.ok) throw new Error("direct "+res.status);
     return await res.text();
   } finally { clearTimeout(t); }
 }
@@ -187,7 +190,7 @@ function parseInfo(html){
     }catch{}
   }
 
-  // __NEXT_DATA__ (Next.js)
+  // __NEXT_DATA__
   const nextData = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
   if (nextData){
     try{
@@ -200,10 +203,8 @@ function parseInfo(html){
     }catch{}
   }
 
-  // 최후의 SSR 텍스트 백업
-  if (!title) {
-    title = html.match(/class="prod-buy-header__title"[^>]*>\s*([^<]+)\s*</)?.[1]?.trim() || title;
-  }
+  // 최후 SSR 텍스트
+  if (!title) title = html.match(/class="prod-buy-header__title"[^>]*>\s*([^<]+)\s*</)?.[1]?.trim() || title;
 
   return { title: title || null, prices, currency, provider };
 }
