@@ -1,5 +1,5 @@
 // Netlify Function v1 (Node 18+)
-// 쿠팡 상품명/최저가 추출 API
+// 쿠팡 상품명/최저가 추출 (딥링크와 무관, 짧은링크 해체 포함)
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
@@ -14,23 +14,27 @@ exports.handler = async (event) => {
     const { url } = JSON.parse(event.body || "{}");
     if (!url) return json({ success:false, error:"No URL provided" }, 400);
 
-    const finalUrl = await normalizeUrl(url);     // ✅ 짧은링크 해체 + itemId 보존
-    const html = await getFastestHtml(finalUrl);  // ✅ 렌더 대기 강화
+    const finalUrl = await normalizeUrl(url);     // 짧은링크 해체 + itemId/vendorItemId 보존
+    const html = await getFastestHtml(finalUrl);
 
     const parsed = parseInfo(html) || { title:null, prices:[], currency:"KRW", provider:"none" };
-    const fallback = pickPriceFallback(html);     // 모든 후보 수집(Set → array)
+    const fallback = pickPriceFallback(html);     // 배열
 
-    const all = [...(parsed.prices||[]), ...fallback].filter(n => Number.isFinite(n) && n > 0);
+    const all = [
+      ...(parsed.prices || []),
+      ...fallback,
+    ].filter(n => Number.isFinite(n) && n > 0);
+
     const minPrice = all.length ? Math.min(...all) : null;
 
     return json({
       success: true,
       finalUrl,
       title: parsed.title ?? null,
-      price: minPrice != null ? String(minPrice) : null,  // ✅ 최저가
+      price: minPrice != null ? String(minPrice) : null, // 최저가
       currency: parsed.currency ?? "KRW",
       provider: parsed.provider ?? null,
-      debug: { count: all.length, sample: all.slice(0, 20) }
+      debug: { priceCandidates: all.slice(0, 20) },
     });
   } catch (e) {
     return json({ success:false, error:String(e?.message || e) }, 500);
@@ -45,7 +49,7 @@ function json(obj, code=200){
 async function normalizeUrl(input){
   let u = String(input || "").trim();
 
-  // ✅ 짧은링크 해체
+  // link.coupang.com 짧은링크 → 원본으로
   if (u.includes("link.coupang.com")) {
     const r = await fetch(u, { method: "HEAD", redirect: "manual" });
     const loc = r.headers.get("location");
@@ -53,9 +57,12 @@ async function normalizeUrl(input){
   }
 
   const url = new URL(u);
+
+  // 중요한 SKU 파라미터 백업
   const itemId = url.searchParams.get("itemId");
   const vendorItemId = url.searchParams.get("vendorItemId");
 
+  // 추적 파라미터 제거
   [
     "redirect","src","addtag","itime","lptag","wTime","wPcid","wRef","traceid",
     "pageType","pageValue","spec","ctag","mcid","placementid","clickBeacon",
@@ -64,7 +71,7 @@ async function normalizeUrl(input){
     "puid","requestid","ctime","contentkeyword","portal","landing_exp","subparam"
   ].forEach(p => url.searchParams.delete(p));
 
-  const m = url.pathname.match(/\/(vp\/)?products\/(\d+)/);
+  const m = url.pathname.match(new RegExp("\\/(vp\\/)?products\\/(\\d+)"));
   if (!m) return url.toString();
 
   const out = new URL(`https://www.coupang.com/vp/products/${m[2]}`);
@@ -76,9 +83,9 @@ async function normalizeUrl(input){
 // ---------- 스크래핑 ----------
 async function getFastestHtml(finalUrl){
   const attempts = [
-    () => scrapeWithScrapingBee(finalUrl, 14000, desktopHeaders(), true),
-    () => scrapeWithScrapingBee(finalUrl, 14000, mobileHeaders(),  true),
-    () => scrapeWithScrapingBee(finalUrl, 7000,  desktopHeaders(), false),
+    () => scrapeWithScrapingBee(finalUrl, 12000, desktopHeaders(), true),
+    () => scrapeWithScrapingBee(finalUrl, 12000, mobileHeaders(),  true),
+    () => scrapeWithScrapingBee(finalUrl,  6000, desktopHeaders(), false),
   ];
   try { return await Promise.any(attempts.map(fn => fn())); }
   catch {
@@ -106,7 +113,7 @@ async function scrapeWithScrapingBee(url, timeoutMs, headers, render=true){
     url,
     render_js: render ? "true" : "false",
     country_code: "kr",
-    ...(render ? { wait:"2500", wait_for:'meta[property="og:title"], script[type="application/ld+json"]' } : {}),
+    ...(render ? { wait:"2000", wait_for:'meta[property="og:title"], script[type="application/ld+json"]' } : {}),
     ...(process.env.SCRAPINGBEE_PREMIUM === "1" ? { premium_proxy:"true" } : {}),
     forward_headers: "true",
   };
@@ -124,7 +131,7 @@ async function scrapeWithScrapingBee(url, timeoutMs, headers, render=true){
   } finally { clearTimeout(t); }
 }
 
-// ---------- 파싱(옵션 20개까지 가격 싹 긁기) ----------
+// ---------- 파싱(정규식은 전부 RegExp로 안전 처리) ----------
 function parseInfo(html){
   const prices = [];
   let title = null, currency = "KRW", provider = "none";
@@ -138,12 +145,13 @@ function parseInfo(html){
   const pullAll = (src, re) => { for (const m of src.matchAll(re)) push(m[1]); };
 
   // JSON-LD
-  const ldBlocks = [...html.matchAll(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/gi)]
+  const reLd = new RegExp('<script type="application\\/ld\\+json">([\\s\\S]*?)<\\/script>', 'gi');
+  const ldBlocks = [...html.matchAll(reLd)]
     .map(m => { try { return JSON.parse(m[1]); } catch { return null; } })
     .filter(Boolean)
     .flatMap(o => Array.isArray(o) ? o : (o['@graph'] ? o['@graph'] : [o]));
 
-  const prods = ldBlocks.filter(o => o && (o['@type']==='Product' || o['@type']?.includes?.('Product') || o.name));
+  const prods = ldBlocks.filter(o => o && (o['@type']==='Product' || (Array.isArray(o['@type']) && o['@type'].includes('Product')) || o.name));
   if (prods.length){
     provider = "json-ld";
     const p0 = prods.find(p => p?.name);
@@ -160,25 +168,28 @@ function parseInfo(html){
   }
 
   // og / <title>
-  const og = html.match(/<meta property="og:title" content="([^"]+)"/i) || html.match(/<meta name="title" content="([^"]+)"/i);
+  const reOg1 = new RegExp('<meta property="og:title" content="([^"]+)"', 'i');
+  const reOg2 = new RegExp('<meta name="title" content="([^"]+)"', 'i');
+  const og = html.match(reOg1) || html.match(reOg2);
   if (!title && og?.[1]) { title = og[1]; provider = provider === "none" ? "meta" : provider; }
   if (!title){
-    const t = html.match(/<title>([^<]+)<\/title>/i);
+    const reTitle = new RegExp('<title>([^<]+)<\\/title>', 'i');
+    const t = html.match(reTitle);
     if (t?.[1]) { title = t[1].trim(); provider = provider === "none" ? "title" : provider; }
   }
 
-  // __NUXT__ 전체 스캔 (옵션/버전 배열 포함)
-  const nuxt = html.match(/window\.__NUXT__\s*=\s*(\{[\s\S]*?\});/);
+  // __NUXT__
+  const reNuxt = new RegExp('window\\.__NUXT__\\s*=\\s*(\\{[\\s\\S]*?\\});');
+  const nuxt = html.match(reNuxt);
   if (nuxt){
     try{
       const s = JSON.stringify(JSON.parse(nuxt[1]));
-      if (!title) title = s.match(/"productName"\s*:\s*"([^"]+)"/)?.[1] || s.match(/"name"\s*:\s*"([^"]+)"/)?.[1] || title;
-
-      const keys = [
-        "couponPrice","finalPrice","discountedPrice","salePrice","lowPrice","price","totalPrice",
-        // 옵션/버전 배열에서 자주 쓰이는 키들:
-        "optionPrice","dealPrice","memberPrice","cardPrice","instantDiscountPrice"
-      ];
+      if (!title) {
+        const m1 = s.match(new RegExp('"productName"\\s*:\\s*"([^"]+)"'));
+        const m2 = s.match(new RegExp('"name"\\s*:\\s*"([^"]+)"'));
+        title = (m1?.[1] || m2?.[1] || title);
+      }
+      const keys = ["couponPrice","finalPrice","discountedPrice","salePrice","lowPrice","price","totalPrice","optionPrice","dealPrice","memberPrice","cardPrice","instantDiscountPrice"];
       keys.forEach(k => pullAll(s, new RegExp(`"${k}"\\s*:\\s*("?[\\d,\\.]+\"?)`, "gi")));
       provider = provider === "none" ? "__NUXT__" : provider;
     } catch {}
@@ -197,18 +208,22 @@ function pickPriceFallback(html){
   };
   const pushAll = re => { for (const m of html.matchAll(re)) { const n = toNum(m[1]); if (n) out.add(n); } };
 
-  [
-    /data-rt-price="([\d,\.]+)"/gi,
-    /data-price="([\d,\.]+)"/gi,
-    /class="total-price[^"]*">[\s\S]*?([\d,\.]+)\s*원/gi,
-    /class="prod-price[^"]*">[\s\S]*?([\d,\.]+)\s*원/gi,
-    /aria-label="가격\s*([\d,\.]+)\s*원"/gi,
-    /<meta property="product:price:amount" content="([^"]+)"/gi,
-    /<meta property="og:price:amount" content="([^"]+)"/gi,
-    /"couponPrice"\s*:\s*("?[\d,\.]+"?)/gi,
-    /"finalPrice"\s*:\s*("?[\d,\.]+"?)/gi,
-    /"discountedPrice"\s*:\s*("?[\d,\.]+"?)/gi,
-    /"salePrice"\s*:\s*("?[\d,\.]+"?)/gi,
-    /"lowPrice"\s*:\s*("?[\d,\.]+"?)/gi,
-    /"price"\s*:\s*("?[\d,\.]+"?)/gi,
-    /"totalPrice"\s*:\s*("?[\d,\.
+  const patterns = [
+    new RegExp('data-rt-price="([\\d,\\.]+)"','gi'),
+    new RegExp('data-price="([\\d,\\.]+)"','gi'),
+    new RegExp('class="total-price[^"]*">[\\s\\S]*?([\\d,\\.]+)\\s*원','gi'),
+    new RegExp('class="prod-price[^"]*">[\\s\\S]*?([\\d,\\.]+)\\s*원','gi'),
+    new RegExp('aria-label="가격\\s*([\\d,\\.]+)\\s*원"','gi'),
+    new RegExp('<meta property="product:price:amount" content="([^"]+)"','gi'),
+    new RegExp('<meta property="og:price:amount" content="([^"]+)"','gi'),
+    new RegExp('"couponPrice"\\s*:\\s*("?[\\d,\\.]+"?)','gi'),
+    new RegExp('"finalPrice"\\s*:\\s*("?[\\d,\\.]+"?)','gi'),
+    new RegExp('"discountedPrice"\\s*:\\s*("?[\\d,\\.]+"?)','gi'),
+    new RegExp('"salePrice"\\s*:\\s*("?[\\d,\\.]+"?)','gi'),
+    new RegExp('"lowPrice"\\s*:\\s*("?[\\d,\\.]+"?)','gi'),
+    new RegExp('"price"\\s*:\\s*("?[\\d,\\.]+"?)','gi'),
+    new RegExp('"totalPrice"\\s*:\\s*("?[\\d,\\.]+"?)','gi'),
+  ];
+  patterns.forEach(pushAll);
+  return [...out];
+}
