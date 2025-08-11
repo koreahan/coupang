@@ -1,248 +1,202 @@
-// Netlify Function v1 (Node 18+)
-// 쿠팡 상품명/최저가 추출 API
-const CORS = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
-};
+// netlify/functions/create-deeplink.js
+const crypto = require("crypto");
+const axios = require("axios");
+
+const HOST = "https://api-gateway.coupang.com";
+const PATH = "/v2/providers/affiliate_open_api/apis/openapi/v1/deeplink";
+
+const ACCESS = process.env.COUPANG_ACCESS_KEY;
+const SECRET = process.env.COUPANG_SECRET_KEY;
+
+function utcSignedDate() {
+  const d = new Date();
+  const p = n => String(n).padStart(2, "0");
+  return (
+    String(d.getUTCFullYear()).slice(2) +
+    p(d.getUTCMonth() + 1) +
+    p(d.getUTCDate()) + "T" +
+    p(d.getUTCHours()) +
+    p(d.getUTCMinutes()) +
+    p(d.getUTCSeconds()) + "Z"
+  );
+}
+
+function buildAuth(method, path, query = "") {
+  const datetime = utcSignedDate();
+  const message = `${datetime}${method.toUpperCase()}${path}${query}`;
+  const signature = crypto.createHmac("sha256", SECRET).update(message, "utf8").digest("hex");
+  const header = `CEA algorithm=HmacSHA256,access-key=${ACCESS},signed-date=${datetime},signature=${signature}`;
+  return { header, datetime, message, signature };
+}
+
+// --- short 링크 해제 (link.coupang.com → www.coupang.com) ---
+async function resolveShortIfNeeded(inputUrl) {
+  const isShort = /^https?:\/\/link\.coupang\.com\//i.test(inputUrl);
+  if (!isShort) return inputUrl;
+
+  // 최대 5번까지 30x 따라감(HEAD → Location)
+  let cur = inputUrl;
+  for (let i = 0; i < 5; i++) {
+    // redirects를 우리가 직접 따라가기 위해 3xx만 허용
+    const r = await axios
+      .head(cur, {
+        maxRedirects: 0,
+        validateStatus: (s) => s >= 200 && s < 400,
+        timeout: 15000
+      })
+      .catch((e) => e?.response);
+
+    if (!r) break;
+
+    const loc = r.headers?.location;
+    if (!loc) break;
+
+    // 상대경로 대비
+    cur = new URL(loc, cur).toString();
+
+    // 원본 상품 도메인으로 오면 종료
+    if (/^https?:\/\/(www\.)?coupang\.com\//i.test(cur)) {
+      return cur;
+    }
+  }
+  // 못 풀어도 일단 현재값 반환(하단에서 한 번 더 검증)
+  return cur;
+}
 
 exports.handler = async (event) => {
+  const qs = event.queryStringParameters || {};
+  const debug = qs.debug === "1";
+
+  if (event.httpMethod !== "POST") {
+    return {
+      statusCode: 405,
+      body: JSON.stringify({
+        success: false,
+        error: { code: "METHOD_NOT_ALLOWED", message: "POST only" }
+      })
+    };
+  }
+
+  // body 파싱
+  let url = "";
   try {
-    if (event.httpMethod === "OPTIONS") {
-      return { statusCode: 200, headers: CORS, body: "" };
+    const body = JSON.parse(event.body || "{}");
+    url = (body.url || "").trim();
+  } catch {
+    return {
+      statusCode: 400,
+      body: JSON.stringify({
+        success: false,
+        error: { code: "BAD_JSON", message: "Invalid JSON body" }
+      })
+    };
+  }
+  if (!url) {
+    return {
+      statusCode: 400,
+      body: JSON.stringify({
+        success: false,
+        error: { code: "URL_REQUIRED", message: "url required" }
+      })
+    };
+  }
+
+  // ★ 짧은링크면 먼저 원본으로 해제
+  let finalUrl;
+  try {
+    finalUrl = await resolveShortIfNeeded(url);
+  } catch (e) {
+    return {
+      statusCode: 502,
+      body: JSON.stringify({
+        success: false,
+        error: { code: "RESOLVE_FAILED", message: String(e?.message || e) },
+        input: { url, finalUrl: null }
+      })
+    };
+  }
+
+  // 원본 도메인 검증 (쿠팡 상품 URL만 허용)
+  if (!/^https?:\/\/(www\.)?coupang\.com\//i.test(finalUrl)) {
+    return {
+      statusCode: 400,
+      body: JSON.stringify({
+        success: false,
+        error: {
+          code: "INVALID_URL",
+          message: "쿠팡 상품 원본 URL로 해제되지 않았습니다."
+        },
+        input: { url, finalUrl }
+      })
+    };
+  }
+
+  // 서명 빌드 (쿼리 없음)
+  const { header, datetime, message, signature } = buildAuth("POST", PATH, "");
+
+  try {
+    const resp = await axios.post(
+      `${HOST}${PATH}`,
+      { coupangUrls: [finalUrl] }, // ★ 원본 URL로 전송
+      {
+        headers: {
+          Authorization: header,
+          "Content-Type": "application/json"
+        },
+        timeout: 15000,
+        validateStatus: () => true
+      }
+    );
+
+    // debug 모드 응답
+    if (debug) {
+      return {
+        statusCode: resp.status,
+        body: JSON.stringify({
+          success: resp.status === 200 && resp.data?.data?.length > 0,
+          upstreamStatus: resp.status,
+          upstreamData: resp.data,
+          debug: {
+            datetime,
+            message,
+            signature: signature.slice(0, 16) + "..."
+          },
+          input: { url, finalUrl }
+        })
+      };
     }
-    if (event.httpMethod !== "POST") {
-      return { statusCode: 405, headers: CORS, body: "POST only" };
+
+    if (resp.status === 200 && resp.data?.data?.length) {
+      const item = resp.data.data[0];
+      const link = item?.shortenUrl || item?.landingUrl || null;
+      return {
+        statusCode: 200,
+        body: JSON.stringify({ success: true, link, raw: resp.data })
+      };
     }
 
-    const { url } = JSON.parse(event.body || "{}");
-    if (!url) return json({ success: false, error: "No URL provided" }, 400);
-
-    const finalUrl = await normalizeUrl(url);
-    const html = await getFastestHtml(finalUrl);
-
-    const parsed = parseInfo(html) || { title: null, prices: [], currency: "KRW", provider: "none" };
-    const fallbackPrices = pickPriceFallback(html); // number[]
-
-    const allPrices = [
-      ...(parsed.prices || []),
-      ...fallbackPrices,
-    ].filter(n => Number.isFinite(n) && n > 0);
-
-    const minPrice = allPrices.length ? Math.min(...allPrices) : null;
-
-    return json({
-      success: true,
-      finalUrl,
-      title: parsed.title ?? null,
-      price: minPrice != null ? String(minPrice) : null, // ✅ 최저가
-      currency: parsed.currency ?? "KRW",
-      provider: parsed.provider ?? null,
-      // 디버깅 필요 시 확인 후 제거
-      debug: { prices: allPrices.slice(0, 20) }
-    });
-  } catch (err) {
-    return json({ success: false, error: String(err?.message || err) }, 500);
+    // 업스트림이 200인데 rCode 400 같은 경우를 위해 원문 그대로 반환
+    return {
+      statusCode: 502,
+      body: JSON.stringify({
+        success: false,
+        reason: "UPSTREAM_ERROR",
+        status: resp.status,
+        data: resp.data,
+        input: { url, finalUrl }
+      })
+    };
+  } catch (e) {
+    return {
+      statusCode: 502,
+      body: JSON.stringify({
+        success: false,
+        error: {
+          code: "UPSTREAM_ERROR",
+          message: String(e?.response?.data || e.message)
+        },
+        input: { url, finalUrl }
+      })
+    };
   }
 };
-
-function json(obj, code = 200) {
-  return {
-    statusCode: code,
-    headers: { "Content-Type": "application/json", ...CORS },
-    body: JSON.stringify(obj),
-  };
-}
-
-// ========== URL 정규화: 짧은링크 해제 + 추적 제거 + itemId/vendorItemId 보존 ==========
-async function normalizeUrl(input) {
-  let u = String(input || "").trim();
-
-  if (u.includes("link.coupang.com")) {
-    const r = await fetch(u, { method: "HEAD", redirect: "manual" });
-    const loc = r.headers.get("location");
-    if (loc) u = loc;
-  }
-
-  const url = new URL(u);
-  const itemId = url.searchParams.get("itemId");
-  const vendorItemId = url.searchParams.get("vendorItemId");
-
-  [
-    "redirect","src","addtag","itime","lptag","wTime","wPcid","wRef","traceid",
-    "pageType","pageValue","spec","ctag","mcid","placementid","clickBeacon",
-    "campaignid","puidType","contentcategory","imgsize","pageid","tsource",
-    "deviceid","token","contenttype","subid","sig","impressionid","campaigntype",
-    "puid","requestid","ctime","contentkeyword","portal","landing_exp","subparam"
-  ].forEach(p => url.searchParams.delete(p));
-
-  const m = url.pathname.match(/\/(vp\/)?products\/(\d+)/);
-  if (!m) return url.toString();
-
-  const out = new URL(`https://www.coupang.com/vp/products/${m[2]}`);
-  if (itemId) out.searchParams.set("itemId", itemId);
-  if (vendorItemId) out.searchParams.set("vendorItemId", vendorItemId);
-  return out.toString();
-}
-
-// ========== 병렬 시도 ==========
-async function getFastestHtml(finalUrl) {
-  const attempts = [
-    () => scrapeWithScrapingBee(finalUrl, 12000, desktopHeaders(), true),
-    () => scrapeWithScrapingBee(finalUrl, 12000, mobileHeaders(), true),
-    () => scrapeWithScrapingBee(finalUrl, 6000,  desktopHeaders(), false),
-  ];
-  try {
-    return await Promise.any(attempts.map(fn => fn()));
-  } catch {
-    const settled = await Promise.allSettled(attempts.map(fn => fn()));
-    const reasons = settled.map(r => r.status === "rejected" ? String(r.reason) : "").filter(Boolean);
-    throw new Error("All attempts failed: " + reasons.join(" | "));
-  }
-}
-
-function desktopHeaders() {
-  return {
-    "User-Agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-  };
-}
-function mobileHeaders() {
-  return {
-    "User-Agent":
-      "Mozilla/5.0 (Linux; Android 13; SM-S908N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36",
-    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-  };
-}
-
-// ========== ScrapingBee ==========
-async function scrapeWithScrapingBee(url, timeoutMs, headers, render = true) {
-  const apiKey = process.env.SCRAPINGBEE_KEY;
-  if (!apiKey) throw new Error("Missing SCRAPINGBEE_KEY");
-
-  const params = {
-    api_key: apiKey,
-    url,
-    render_js: render ? "true" : "false",
-    country_code: "kr",
-    ...(render
-      ? { wait: "2000", wait_for: 'meta[property="og:title"], script[type="application/ld+json"]' }
-      : {}),
-    ...(process.env.SCRAPINGBEE_PREMIUM === "1" ? { premium_proxy: "true" } : {}),
-    forward_headers: "true",
-  };
-  const qs = new URLSearchParams(params);
-
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-  try {
-    const res = await fetch(`https://app.scrapingbee.com/api/v1?${qs}`, {
-      method: "GET",
-      headers,
-      signal: ctrl.signal,
-    });
-    if (!res.ok) {
-      const body = await res.text().catch(() => "");
-      const short = body.length > 300 ? body.slice(0, 300) + "..." : body;
-      throw new Error(`ScrapingBee ${res.status} ${short}`);
-    }
-    return res.text();
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-// ========== 파싱 ==========
-function parseInfo(html) {
-  const prices = [];
-  let title = null;
-  let currency = "KRW";
-  let provider = "none";
-
-  const toNum = v => {
-    const s = String(v ?? "").replace(/[^0-9.]/g, "");
-    const n = s ? Number(s) : NaN;
-    return Number.isFinite(n) && n > 0 ? n : null;
-  };
-  const pushPrices = (...vals) => vals.forEach(v => { const n = toNum(v); if (n) prices.push(n); });
-  const pullAll = (src, re) => { for (const m of src.matchAll(re)) { const n = toNum(m[1]); if (n) prices.push(n); } };
-
-  // JSON-LD
-  const ldBlocks = [...html.matchAll(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/gi)]
-    .map(m => { try { return JSON.parse(m[1]); } catch { return null; } })
-    .filter(Boolean)
-    .flatMap(o => Array.isArray(o) ? o : (o['@graph'] ? o['@graph'] : [o]));
-
-  const products = ldBlocks.filter(o => o && (o['@type'] === 'Product' || o['@type']?.includes?.('Product') || o.name));
-  if (products.length) {
-    provider = "json-ld";
-    const p0 = products.find(p => p?.name);
-    if (p0?.name) title = p0.name;
-
-    for (const p of products) {
-      const offers = Array.isArray(p.offers) ? p.offers : (p.offers ? [p.offers] : []);
-      for (const ofr of offers) {
-        if (ofr?.priceCurrency) currency = ofr.priceCurrency;
-        pushPrices(ofr?.price, ofr?.lowPrice, ofr?.highPrice);
-        const ps = ofr?.priceSpecification;
-        (Array.isArray(ps) ? ps : ps ? [ps] : []).forEach(spec => {
-          pushPrices(spec?.price, spec?.minPrice, spec?.maxPrice);
-        });
-      }
-    }
-  }
-
-  // og:title → 없으면 <title>
-  const og = html.match(/<meta property="og:title" content="([^"]+)"/i)
-        || html.match(/<meta name="title" content="([^"]+)"/i);
-  if (!title && og?.[1]) { title = og[1]; provider = provider === "none" ? "meta" : provider; }
-  if (!title) {
-    const t = html.match(/<title>([^<]+)<\/title>/i);
-    if (t?.[1]) { title = t[1].trim(); provider = provider === "none" ? "title" : provider; }
-  }
-
-  // __NUXT__ 내부 스캔
-  const nuxt = html.match(/window\.__NUXT__\s*=\s*(\{[\s\S]*?\});/);
-  if (nuxt) {
-    try {
-      const s = JSON.stringify(JSON.parse(nuxt[1]));
-      if (!title) title = s.match(/"productName"\s*:\s*"([^"]+)"/)?.[1] || s.match(/"name"\s*:\s*"([^"]+)"/)?.[1] || title;
-      ["couponPrice","finalPrice","discountedPrice","salePrice","lowPrice","price","totalPrice"]
-        .forEach(key => pullAll(s, new RegExp(`"${key}"\\s*:\\s*("?[\\d,\\.]+\"?)`, "gi")));
-      provider = provider === "none" ? "__NUXT__" : provider;
-    } catch {}
-  }
-
-  return { title: title || null, prices, currency, provider };
-}
-
-// ========== HTML 전역 후보 수집 ==========
-function pickPriceFallback(html) {
-  const nums = new Set();
-  const toNum = v => {
-    const s = String(v ?? "").replace(/[^0-9.]/g, "");
-    const n = s ? Number(s) : NaN;
-    return Number.isFinite(n) && n > 0 ? n : null;
-  };
-  const pushAll = re => { for (const m of html.matchAll(re)) { const n = toNum(m[1]); if (n) nums.add(n); } };
-
-  [
-    /data-rt-price="([\d,\.]+)"/gi,
-    /data-price="([\d,\.]+)"/gi,
-    /class="total-price[^"]*">[\s\S]*?([\d,\.]+)\s*원/gi,
-    /class="prod-price[^"]*">[\s\S]*?([\d,\.]+)\s*원/gi,
-    /aria-label="가격\s*([\d,\.]+)\s*원"/gi,
-    /"couponPrice"\s*:\s*("?[\d,\.]+"?)/gi,
-    /"finalPrice"\s*:\s*("?[\d,\.]+"?)/gi,
-    /"discountedPrice"\s*:\s*("?[\d,\.]+"?)/gi,
-    /"salePrice"\s*:\s*("?[\d,\.]+"?)/gi,
-    /"lowPrice"\s*:\s*("?[\d,\.]+"?)/gi,
-    /"price"\s*:\s*("?[\d,\.]+"?)/gi,
-    /"totalPrice"\s*:\s*("?[\d,\.]+"?)/gi,
-    /<meta property="product:price:amount" content="([^"]+)"/gi,
-    /<meta property="og:price:amount" content="([^"]+)"/gi,
-  ].forEach(pushAll);
-
-  return [...nums];
-}
