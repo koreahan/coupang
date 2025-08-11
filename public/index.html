@@ -12,7 +12,6 @@
     label{font-size:13px;color:#666;display:block;margin:12px 0 6px}
     input[type=text]{width:100%;padding:14px;border:1px solid #e5e7eb;border-radius:12px;font-size:16px}
     .btn{background:#111;color:#fff;border:0;border-radius:12px;padding:10px 14px;font-size:14px;cursor:pointer}
-    .btn[disabled]{opacity:.5;cursor:not-allowed}
     .btn.secondary{background:#fff;color:#111;border:1px solid #e5e7eb}
     .btn.small{padding:6px 10px;font-size:12px;border-radius:10px}
     .row{display:flex;gap:8px;flex-wrap:wrap}
@@ -43,14 +42,10 @@
 
       <div class="row-between" style="margin-top:14px">
         <label style="margin:0">파트너스 링크</label>
-        <div class="row" style="gap:6px">
-          <button id="btnCopyLink" class="btn secondary small" disabled>딥링크 복사</button>
-          <button id="btnCopyName" class="btn secondary small" disabled>상품명 복사</button>
-          <button id="btnCopyPrice" class="btn secondary small" disabled>가격 복사</button>
-        </div>
+        <button id="btnCopyLink" class="btn secondary small" disabled>링크 복사</button>
       </div>
       <div id="deeplink" class="out">(아직 없음)</div>
-      <div class="muted">* 링크가 생성되면 ‘딥링크 복사’가 활성화됩니다.</div>
+      <div class="muted">* 링크가 생성되면 ‘링크 복사’ 버튼이 활성화됩니다.</div>
 
       <div class="row" style="margin-top:10px">
         <div style="flex:1;min-width:220px">
@@ -74,17 +69,15 @@
   </div>
 
 <script>
-document.addEventListener('DOMContentLoaded', () => {
-  // ====== 설정 ======
-  const SITE_ORIGIN = ""; // 같은 도메인이면 "" 유지
+  // 같은 Netlify 도메인에서 열면 "" 유지. 다른 도메인에서 열면 절대경로 기입
+  const SITE_ORIGIN = ""; // 예: "https://coupanga.netlify.app"
   const ENDPOINT_DEEP = SITE_ORIGIN + "/.netlify/functions/create-deeplink";
   const ENDPOINT_INFO = SITE_ORIGIN + "/.netlify/functions/product-info";
 
-  // ====== helpers ======
   const $ = id => document.getElementById(id);
   const $inp = $("inp"), $err = $("err"), $raw = $("raw");
   const $deeplink = $("deeplink"), $pname = $("pname"), $pprice = $("pprice"), $tpl = $("tpl");
-  const $btnCopyLink = $("btnCopyLink"), $btnGo = $("btnGo"), $btnInfo = $("btnInfo");
+  const $btnCopyLink = $("btnCopyLink");
 
   const firstUrl = s => (String(s||"").match(/https?:\/\/[^\s]+/)||[])[0] || "";
   const fmt = n => Number(n||0).toLocaleString("ko-KR")+"원";
@@ -105,61 +98,45 @@ document.addEventListener('DOMContentLoaded', () => {
     const text = await res.text(); let json; try{ json=JSON.parse(text);}catch{ json={ parseError:true, raw:text }; }
     return { ok:res.ok, status:res.status, json, text };
   };
-
-  // ====== 복사 버튼 enable/disable 관리 ======
-  const updateCopyButtons = ()=> {
+  const updateCopyLinkButton = ()=> {
     const link = $deeplink.textContent?.trim();
-    const name = $pname.textContent?.trim();
-    const price = $pprice.textContent?.trim();
-    $("btnCopyLink").disabled = !link || link.startsWith("(");
-    $("btnCopyName").disabled = !name || name === "-";
-    $("btnCopyPrice").disabled = !price || price === "-";
+    const valid = link && !link.startsWith("(");
+    $btnCopyLink.disabled = !valid;
   };
 
-  const normalize = u => {
-    const m = String(u||"").match(/\/products\/(\d{6,})/);
-    return m ? `https://www.coupang.com/vp/products/${m[1]}` : u;
-  };
-
-  // 클릭 연타 방지
-  let _busy = false;
-  const withBusy = async (fn) => {
-    if (_busy) return;
-    _busy = true; $btnGo.disabled = true; $btnInfo.disabled = true;
-    try { await fn(); }
-    finally { _busy = false; $btnGo.disabled = false; $btnInfo.disabled = false; }
-  };
-
-  // ====== 이벤트 ======
-  // 1) 딥링크 생성 → 성공 후 자동 상품정보 채움
-  $btnGo.onclick = () => withBusy(async () => {
+  // 1) 딥링크 생성
+  $("btnGo").onclick = async () => {
     setErr(""); $raw.textContent="(요청 중...)";
-    $deeplink.textContent="(생성 중...)"; $pname.textContent="-"; $pprice.textContent="-";
-    updateCopyButtons(); setTpl();
+    $deeplink.textContent="(생성 중...)"; $pname.textContent="-"; $pprice.textContent="-"; updateCopyLinkButton(); setTpl();
 
-    const url0 = firstUrl($inp.value);
-    if(!url0){ setErr("쿠팡 링크를 입력하세요."); $deeplink.textContent="(아직 없음)"; updateCopyButtons(); return; }
-    const url = normalize(url0);
+    const url = firstUrl($inp.value);
+    if(!url){ setErr("쿠팡 링크를 입력하세요."); $deeplink.textContent="(아직 없음)"; updateCopyLinkButton(); return; }
 
     try{
       const deep = await postJSON(ENDPOINT_DEEP, { url });
       $raw.textContent = deep.text;
-      if (!deep.json || deep.json.success === false) throw new Error(deep.json?.error?.message || deep.json?.reason || ("HTTP "+deep.status));
+      if (!deep.json || deep.json.success === false) {
+        throw new Error(deep.json?.error?.message || deep.json?.reason || ("HTTP "+deep.status));
+      }
       const link = deep.json.deeplink || deep.json.link || "";
       $deeplink.textContent = link || "(생성 실패)";
-      updateCopyButtons();
+      updateCopyLinkButton();
 
-      await fillProductInfo(url); // 생성 직후 자동 채움
-    }catch(e){ setErr(e?.message || String(e)); }
-    finally{ setTpl(); }
-  });
+      // 딥링크 성공 직후 상품정보도 자동 채움
+      await fillProductInfo(url);
+    }catch(e){
+      setErr(e?.message || String(e));
+    }finally{
+      setTpl();
+    }
+  };
 
-  // 2) 상품정보 채우기 (수동)
-  $btnInfo.onclick = () => withBusy(async () => {
-    const url0 = firstUrl($inp.value);
-    if(!url0){ setErr("쿠팡 링크를 입력하세요."); return; }
-    await fillProductInfo(normalize(url0), true);
-  });
+  // 2) 상품정보 채우기 (수동 버튼)
+  $("btnInfo").onclick = async () => {
+    const url = firstUrl($inp.value);
+    if(!url){ setErr("쿠팡 링크를 입력하세요."); return; }
+    await fillProductInfo(url, true);
+  };
 
   // 3) 템플릿 복사
   $("btnCopy").onclick = async () => {
@@ -167,32 +144,17 @@ document.addEventListener('DOMContentLoaded', () => {
     alert("복사되었습니다.");
   };
 
-  // 4) 복사 버튼 3종
-  $("btnCopyLink").onclick = async () => {
+  // 4) 링크 복사
+  $btnCopyLink.onclick = async () => {
     const link = $deeplink.textContent?.trim();
     if (!link || link.startsWith("(")) return;
     await navigator.clipboard.writeText(link);
-    flashCopied($("btnCopyLink"));
+    const prev = $btnCopyLink.textContent;
+    $btnCopyLink.textContent = "복사됨!";
+    setTimeout(()=>{ $btnCopyLink.textContent = prev; }, 1200);
   };
-  $("btnCopyName").onclick = async () => {
-    const name = $pname.textContent?.trim();
-    if (!name || name === "-") return;
-    await navigator.clipboard.writeText(name);
-    flashCopied($("btnCopyName"));
-  };
-  $("btnCopyPrice").onclick = async () => {
-    const price = $pprice.textContent?.trim();
-    if (!price || price === "-") return;
-    await navigator.clipboard.writeText(price);
-    flashCopied($("btnCopyPrice"));
-  };
-  function flashCopied(btn) {
-    const prev = btn.textContent;
-    btn.textContent = "복사됨!";
-    setTimeout(()=>{ btn.textContent = prev; }, 1200);
-  }
 
-  // ====== 핵심: product-info 호출해 화면 반영 ======
+  // 상품정보 호출 + 화면 반영
   async function fillProductInfo(url, appendRaw){
     try{
       const r = await fetch(ENDPOINT_INFO, {
@@ -201,33 +163,24 @@ document.addEventListener('DOMContentLoaded', () => {
       });
       const txt = await r.text(); let j; try{ j=JSON.parse(txt);}catch{ j=null; }
       if (appendRaw) $raw.textContent += "\n\n--- product-info ---\n" + (txt || "(empty)");
+
       if (!j?.success) throw new Error(j?.error || "product-info 실패");
 
+      // 백엔드 최저가 우선 로직으로 내려온 값 그대로 사용
       const title = j.title ?? "";
-      const price = Number.isFinite(j.price) ? fmt(j.price) : "-"; // 백엔드 '최저가(정수)' → 원화표기
+      const price = j.price != null ? fmt(j.price) : "-";
+
       if (title) $pname.textContent = title;
       if (price) $pprice.textContent = price;
 
-      updateCopyButtons();
       setTpl();
     }catch(e){
-      const msg = String(e?.message || e);
-      if (msg.includes("429") || msg.includes("concurrency")) setErr("요청이 많습니다. 잠시 후 다시 시도해주세요.");
-      else setErr(msg);
+      setErr(e?.message || String(e));
     }
   }
 
-  // 콘솔/북마클릿에서 즉시 채우기용 공개 함수
-  window.fillFromApi = async (input) => {
-    const url = normalize((String(input||"").match(/https?:\/\/[^\s]+/)||[])[0] || input);
-    $inp.value = url;
-    await fillProductInfo(url, true);
-  };
-
-  // 초기 렌더
   setTpl();
-  updateCopyButtons();
-});
+  updateCopyLinkButton();
 </script>
 </body>
 </html>
