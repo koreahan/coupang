@@ -69,23 +69,25 @@
   </div>
 
 <script>
-/* ===== 공통 참조 ===== */
+/* ===== DOM ===== */
 const $ = (id) => document.getElementById(id);
-
-/* 필드/버튼 */
 const $inp = $("inp"), $err = $("err"), $raw = $("raw");
 const $deeplink = $("deeplink"), $pname = $("pname"), $pprice = $("pprice"), $tpl = $("tpl");
-const $btnDeep = $("btnDeep"), $btnInfo = $("btnInfo"), $btnCopy = $("btnCopy"), $btnCopyLink = $("btnCopyLink");
+const $btnGo = $("btnGo"), $btnInfo = $("btnInfo"), $btnCopy = $("btnCopy"), $btnCopyLink = $("btnCopyLink");
 
-/* 엔드포인트(네가 쓰던 경로 그대로) */
+/* ===== Endpoints (그대로) ===== */
 const ENDPOINT_DEEP = "/.netlify/functions/create-deeplink";
 const ENDPOINT_INFO = "/.netlify/functions/product-info";
 
-/* 유틸 */
+/* ===== Helpers ===== */
 const firstUrl = (s) => (String(s||"").match(/https?:\/\/[^\s]+/)||[])[0] || "";
 const fmtKRW = (n) => Number(n||0).toLocaleString("ko-KR")+"원";
 const setErr = (msg)=>{ if(!msg){$err.style.display="none";$err.textContent="";} else {$err.style.display="block";$err.textContent=msg;} };
-
+function updateCopyLinkButton(){
+  const link = $deeplink?.textContent?.trim();
+  const valid = link && !link.startsWith("(");
+  if ($btnCopyLink) $btnCopyLink.disabled = !valid;
+}
 function refreshTpl(){
   const name = $pname?.textContent && $pname.textContent !== "-" ? $pname.textContent : "상품명";
   const price = $pprice?.textContent && $pprice.textContent !== "-" ? $pprice.textContent : "가격정보";
@@ -100,39 +102,34 @@ function refreshTpl(){
   }
 }
 
-/* ===== 연타 방지: 로딩 중 버튼 잠그기 + 쿨다운 ===== */
+/* ===== 연타 방지 ===== */
 let BUSY = false;
 const COOL_DOWN_MS = 800;
-
-function setBusy(on) {
+function setBusy(on){
   BUSY = on;
-  const btns = [$btnDeep, $btnInfo, $btnCopy, $btnCopyLink].filter(Boolean);
-  btns.forEach(b => b.disabled = !!on);
+  [$btnGo, $btnInfo, $btnCopy, $btnCopyLink].filter(Boolean).forEach(b=>b.disabled = !!on);
 }
-
-async function withBusy(fn) {
-  if (BUSY) return;             // 이미 로딩 중이면 무시
+async function withBusy(fn){
+  if (BUSY) return;
   setBusy(true);
   try { return await fn(); }
-  finally {
-    // 짧은 쿨다운 후 버튼 다시 활성화
-    setTimeout(() => setBusy(false), COOL_DOWN_MS);
-  }
+  finally { setTimeout(()=>setBusy(false), COOL_DOWN_MS); }
 }
 
 /* ===== 초기화 ===== */
-function resetUI() {
+function resetUI(){
   if ($inp) $inp.value = "";
   if ($deeplink) $deeplink.textContent = "(아직 없음)";
   if ($pname) $pname.textContent = "-";
   if ($pprice) $pprice.textContent = "-";
   if ($raw) $raw.textContent = "(없음)";
   setErr("");
+  updateCopyLinkButton();
   refreshTpl();
 }
 
-/* ===== 액션 ===== */
-async function createDeeplink(url) {
+/* ===== API ===== */
+async function createDeeplink(url){
   const res = await fetch(ENDPOINT_DEEP, {
     method:"POST", headers:{ "Content-Type":"application/json" },
     body: JSON.stringify({ url })
@@ -143,9 +140,10 @@ async function createDeeplink(url) {
   const link = j.deeplink || j.link || j.data?.[0]?.shortenUrl || j.data?.[0]?.deeperUrl || "";
   if (!link) throw new Error("딥링크 생성 실패");
   if ($deeplink) $deeplink.textContent = link;
+  updateCopyLinkButton();
 }
 
-async function fillProductInfo(url) {
+async function fillProductInfo(url){
   const res = await fetch(ENDPOINT_INFO, {
     method:"POST", headers:{ "Content-Type":"application/json" },
     body: JSON.stringify({ url })
@@ -153,30 +151,31 @@ async function fillProductInfo(url) {
   const txt = await res.text(); let j; try{ j = JSON.parse(txt);}catch{ j = { success:false, error:"Non-JSON", raw:txt }; }
   if ($raw) $raw.textContent = txt;
   if (!j.success) throw new Error(j.error || "상품정보 실패");
-
   if ($pname && j.title) $pname.textContent = j.title;
   if ($pprice && j.price) $pprice.textContent = fmtKRW(j.price);
   refreshTpl();
 }
 
-/* ===== 이벤트 바인딩 ===== */
-$btnDeep && ($btnDeep.onclick = () => withBusy(async () => {
+/* ===== 이벤트 ===== */
+// 1) 딥링크 생성 (+ 성공 후 상품정보 자동 채움)
+$btnGo && ($btnGo.onclick = () => withBusy(async () => {
   setErr("");
   if ($deeplink) $deeplink.textContent = "(생성 중...)";
   if ($raw) $raw.textContent = "(요청 중...)";
+  updateCopyLinkButton();
 
   const url = firstUrl($inp?.value);
-  if (!url) { setErr("쿠팡 링크를 입력하세요."); if ($deeplink) $deeplink.textContent = "(아직 없음)"; return; }
+  if (!url) { setErr("쿠팡 링크를 입력하세요."); if ($deeplink) $deeplink.textContent = "(아직 없음)"; updateCopyLinkButton(); return; }
 
   try {
     await createDeeplink(url);
-    // 딥링크 성공 후 자동으로 상품정보 조회(원하면 제거)
-    await fillProductInfo(url);
+    await fillProductInfo(url); // 원하면 주석 처리
   } catch(e) {
     setErr(String(e?.message || e));
   }
 }));
 
+// 2) 상품정보 채우기(수동)
 $btnInfo && ($btnInfo.onclick = () => withBusy(async () => {
   setErr("");
   if ($raw) $raw.textContent = "(요청 중...)";
@@ -186,113 +185,33 @@ $btnInfo && ($btnInfo.onclick = () => withBusy(async () => {
   catch(e){ setErr(String(e?.message || e)); }
 }));
 
-/* 템플릿 복사 → 성공 즉시 전체 초기화 */
+// 3) 템플릿 복사 → 즉시 초기화
 $btnCopy && ($btnCopy.onclick = async () => {
   try {
     await navigator.clipboard.writeText($tpl?.textContent || "");
     alert("복사되었습니다.");
   } finally {
-    resetUI(); // ← 요청대로 초기화
+    resetUI();
   }
 });
 
-/* 링크 복사 → 성공 즉시 전체 초기화 */
+// 4) 링크 복사 → 즉시 초기화
 $btnCopyLink && ($btnCopyLink.onclick = async () => {
   const link = $deeplink?.textContent?.trim();
   if (!link || link.startsWith("(")) { alert("복사할 링크가 없습니다."); return; }
   try {
     await navigator.clipboard.writeText(link);
-    // 짧은 피드백
     const prev = $btnCopyLink.textContent;
     $btnCopyLink.textContent = "복사됨!";
     setTimeout(()=>{ $btnCopyLink.textContent = prev; }, 800);
   } finally {
-    resetUI(); // ← 요청대로 초기화
+    resetUI();
   }
 });
 
 /* 초기 렌더 */
+updateCopyLinkButton();
 refreshTpl();
-</script>
-
-
-  // 1) 딥링크 생성
-  $("btnGo").onclick = async () => {
-    setErr(""); $raw.textContent="(요청 중...)";
-    $deeplink.textContent="(생성 중...)"; $pname.textContent="-"; $pprice.textContent="-"; updateCopyLinkButton(); setTpl();
-
-    const url = firstUrl($inp.value);
-    if(!url){ setErr("쿠팡 링크를 입력하세요."); $deeplink.textContent="(아직 없음)"; updateCopyLinkButton(); return; }
-
-    try{
-      const deep = await postJSON(ENDPOINT_DEEP, { url });
-      $raw.textContent = deep.text;
-      if (!deep.json || deep.json.success === false) {
-        throw new Error(deep.json?.error?.message || deep.json?.reason || ("HTTP "+deep.status));
-      }
-      const link = deep.json.deeplink || deep.json.link || "";
-      $deeplink.textContent = link || "(생성 실패)";
-      updateCopyLinkButton();
-
-      // 딥링크 성공 직후 상품정보도 자동 채움
-      await fillProductInfo(url);
-    }catch(e){
-      setErr(e?.message || String(e));
-    }finally{
-      setTpl();
-    }
-  };
-
-  // 2) 상품정보 채우기 (수동 버튼)
-  $("btnInfo").onclick = async () => {
-    const url = firstUrl($inp.value);
-    if(!url){ setErr("쿠팡 링크를 입력하세요."); return; }
-    await fillProductInfo(url, true);
-  };
-
-  // 3) 템플릿 복사
-  $("btnCopy").onclick = async () => {
-    await navigator.clipboard.writeText($tpl.textContent || "");
-    alert("복사되었습니다.");
-  };
-
-  // 4) 링크 복사
-  $btnCopyLink.onclick = async () => {
-    const link = $deeplink.textContent?.trim();
-    if (!link || link.startsWith("(")) return;
-    await navigator.clipboard.writeText(link);
-    const prev = $btnCopyLink.textContent;
-    $btnCopyLink.textContent = "복사됨!";
-    setTimeout(()=>{ $btnCopyLink.textContent = prev; }, 1200);
-  };
-
-  // 상품정보 호출 + 화면 반영
-  async function fillProductInfo(url, appendRaw){
-    try{
-      const r = await fetch(ENDPOINT_INFO, {
-        method:"POST", headers:{ "Content-Type":"application/json" },
-        body: JSON.stringify({ url })
-      });
-      const txt = await r.text(); let j; try{ j=JSON.parse(txt);}catch{ j=null; }
-      if (appendRaw) $raw.textContent += "\n\n--- product-info ---\n" + (txt || "(empty)");
-
-      if (!j?.success) throw new Error(j?.error || "product-info 실패");
-
-      // 백엔드 최저가 우선 로직으로 내려온 값 그대로 사용
-      const title = j.title ?? "";
-      const price = j.price != null ? fmt(j.price) : "-";
-
-      if (title) $pname.textContent = title;
-      if (price) $pprice.textContent = price;
-
-      setTpl();
-    }catch(e){
-      setErr(e?.message || String(e));
-    }
-  }
-
-  setTpl();
-  updateCopyLinkButton();
 </script>
 </body>
 </html>
