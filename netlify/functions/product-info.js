@@ -1,205 +1,193 @@
-<!DOCTYPE html>
-<html lang="ko">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>쿠팡 딥링크 · 자동 채움</title>
-  <style>
-    body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,Apple SD Gothic Neo,Nanum Gothic,sans-serif;background:#f6f7f9;margin:0}
-    .wrap{max-width:720px;margin:24px auto;padding:0 16px}
-    .card{background:#fff;border:1px solid #e5e7eb;border-radius:16px;padding:16px;box-shadow:0 2px 12px rgba(0,0,0,.05)}
-    h1{font-size:20px;margin:0 0 12px}
-    label{font-size:13px;color:#666;display:block;margin:12px 0 6px}
-    input[type=text]{width:100%;padding:14px;border:1px solid #e5e7eb;border-radius:12px;font-size:16px}
-    .btn{background:#111;color:#fff;border:0;border-radius:12px;padding:10px 14px;font-size:14px;cursor:pointer}
-    .btn[disabled]{opacity:.5;cursor:not-allowed}
-    .btn.secondary{background:#fff;color:#111;border:1px solid #e5e7eb}
-    .btn.small{padding:6px 10px;font-size:12px;border-radius:10px}
-    .row{display:flex;gap:8px;flex-wrap:wrap}
-    .row-between{display:flex;align-items:center;justify-content:space-between;gap:8px}
-    .out{background:#fafafa;border:1px solid #e5e7eb;border-radius:12px;padding:12px;min-height:40px;font-size:14px;word-break:break-all}
-    .error{color:#b00020;background:#fff1f1;border:1px solid #f3c2c2;padding:10px 12px;border-radius:10px;font-size:13px}
-    pre{white-space:pre-wrap;word-break:break-all;background:#f9fafb;border:1px solid #e5e7eb;border-radius:12px;padding:12px;font-size:12px;max-height:320px;overflow:auto}
-    .badge{position:fixed;top:8px;left:8px;background:#111;color:#fff;padding:4px 8px;border-radius:8px;font:12px/1.4 system-ui;z-index:9999}
-    .muted{color:#666;font-size:12px}
-  </style>
-</head>
-<body>
-  <div class="badge">BUILD public/index.html</div>
-  <div class="wrap">
-    <div class="card">
-      <h1>쿠팡 딥링크 · 자동 채움</h1>
+// Netlify Function v1 (Node 18+)
+// 쿠팡 상품명/가격 추출 API
+const CORS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
+};
 
-      <label>문장 전체 붙여넣기 OK (첫 번째 http(s)만 인식)</label>
-      <input id="inp" type="text" placeholder="예) 쿠팡을 추천합니다! https://link.coupang.com/a/XXXXX" autocomplete="off" autocapitalize="off" />
-
-      <div class="row" style="margin-top:10px">
-        <button id="btnGo" class="btn">딥링크 생성</button>
-        <button id="btnInfo" class="btn secondary">상품정보 채우기</button>
-        <button id="btnCopy" class="btn secondary">템플릿 복사</button>
-      </div>
-
-      <div id="err" class="error" style="display:none;margin-top:10px"></div>
-
-      <div class="row-between" style="margin-top:14px">
-        <label style="margin:0">파트너스 링크</label>
-        <button id="btnCopyLink" class="btn secondary small" disabled>링크 복사</button>
-      </div>
-      <div id="deeplink" class="out">(아직 없음)</div>
-      <div class="muted">* 링크가 생성되면 ‘링크 복사’ 버튼이 활성화됩니다.</div>
-
-      <div class="row" style="margin-top:10px">
-        <div style="flex:1;min-width:220px">
-          <label>상품명(자동)</label>
-          <div id="pname" class="out">-</div>
-        </div>
-        <div style="flex:1;min-width:160px">
-          <label>가격(원, 자동)</label>
-          <div id="pprice" class="out">-</div>
-        </div>
-      </div>
-
-      <label style="margin-top:14px">템플릿 미리보기</label>
-      <pre id="tpl" class="out"></pre>
-
-      <details style="margin-top:14px">
-        <summary>RAW 응답(JSON)</summary>
-        <pre id="raw">(없음)</pre>
-      </details>
-    </div>
-  </div>
-
-<script>
-document.addEventListener('DOMContentLoaded', () => {
-  // ====== 설정 ======
-  const SITE_ORIGIN = ""; // 같은 도메인이면 "" 유지 (예: "https://xxxx.netlify.app"로 바꿔도 됨)
-  const ENDPOINT_DEEP = SITE_ORIGIN + "/.netlify/functions/create-deeplink";
-  const ENDPOINT_INFO = SITE_ORIGIN + "/.netlify/functions/product-info";
-
-  // ====== helpers ======
-  const $ = id => document.getElementById(id);
-  const $inp = $("inp"), $err = $("err"), $raw = $("raw");
-  const $deeplink = $("deeplink"), $pname = $("pname"), $pprice = $("pprice"), $tpl = $("tpl");
-  const $btnCopyLink = $("btnCopyLink"), $btnGo = $("btnGo"), $btnInfo = $("btnInfo");
-
-  const firstUrl = s => (String(s||"").match(/https?:\/\/[^\s]+/)||[])[0] || "";
-  const fmt = n => Number(n||0).toLocaleString("ko-KR")+"원";
-  const setErr = msg => { if(!msg){$err.style.display="none";$err.textContent="";return;} $err.style.display="block"; $err.textContent=msg; };
-  const setTpl = ()=>{
-    const name = $pname.textContent && $pname.textContent !== "-" ? $pname.textContent : "상품명";
-    const priceTxt = $pprice.textContent && $pprice.textContent !== "-" ? $pprice.textContent : "가격정보";
-    const link = $deeplink.textContent && !$deeplink.textContent.startsWith("(") ? $deeplink.textContent : "쿠팡링크";
-    $tpl.textContent = `【쿠팡】${name}
-가격: ${priceTxt}
-링크: ${link}
-
-※ 모든 핫딜은 카드 할인 및 쿠폰 적용가 기준입니다.
-※ 이 포스팅은 쿠팡파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받습니다. 구입 시 제품 가격에는 아무런 영향이 없습니다.`;
-  };
-  const postJSON = async (url, body)=>{
-    const res = await fetch(url,{ method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(body) });
-    const text = await res.text(); let json; try{ json=JSON.parse(text);}catch{ json={ parseError:true, raw:text }; }
-    return { ok:res.ok, status:res.status, json, text };
-  };
-  const updateCopyLinkButton = ()=> {
-    const link = $deeplink.textContent?.trim();
-    const valid = link && !link.startsWith("(");
-    $btnCopyLink.disabled = !valid;
-  };
-  const normalize = u => {
-    const m = String(u||"").match(/\/products\/(\d{6,})/);
-    return m ? `https://www.coupang.com/vp/products/${m[1]}` : u;
-  };
-
-  // 클릭 연타 방지
-  let _busy = false;
-  const withBusy = async (fn) => {
-    if (_busy) return;
-    _busy = true; $btnGo.disabled = true; $btnInfo.disabled = true;
-    try { await fn(); }
-    finally { _busy = false; $btnGo.disabled = false; $btnInfo.disabled = false; }
-  };
-
-  // ====== 이벤트 ======
-  // 1) 딥링크 생성 → 성공 후 자동으로 상품정보 채우기
-  $btnGo.onclick = () => withBusy(async () => {
-    setErr(""); $raw.textContent="(요청 중...)";
-    $deeplink.textContent="(생성 중...)"; $pname.textContent="-"; $pprice.textContent="-"; updateCopyLinkButton(); setTpl();
-
-    const url0 = firstUrl($inp.value);
-    if(!url0){ setErr("쿠팡 링크를 입력하세요."); $deeplink.textContent="(아직 없음)"; updateCopyLinkButton(); return; }
-    const url = normalize(url0);
-
-    try{
-      const deep = await postJSON(ENDPOINT_DEEP, { url });
-      $raw.textContent = deep.text;
-      if (!deep.json || deep.json.success === false) throw new Error(deep.json?.error?.message || deep.json?.reason || ("HTTP "+deep.status));
-      const link = deep.json.deeplink || deep.json.link || "";
-      $deeplink.textContent = link || "(생성 실패)";
-      updateCopyLinkButton();
-
-      await fillProductInfo(url); // 생성 직후 자동 채움
-    }catch(e){ setErr(e?.message || String(e)); }
-    finally{ setTpl(); }
-  });
-
-  // 2) 상품정보 채우기 (수동 버튼)
-  $btnInfo.onclick = () => withBusy(async () => {
-    const url0 = firstUrl($inp.value);
-    if(!url0){ setErr("쿠팡 링크를 입력하세요."); return; }
-    await fillProductInfo(normalize(url0), true);
-  });
-
-  // 3) 템플릿 복사
-  $("btnCopy").onclick = async () => {
-    await navigator.clipboard.writeText($tpl.textContent || "");
-    alert("복사되었습니다.");
-  };
-
-  // 4) 링크 복사
-  $btnCopyLink.onclick = async () => {
-    const link = $deeplink.textContent?.trim();
-    if (!link || link.startsWith("(")) return;
-    await navigator.clipboard.writeText(link);
-    const prev = $btnCopyLink.textContent; $btnCopyLink.textContent = "복사됨!"; setTimeout(()=>{ $btnCopyLink.textContent = prev; }, 1200);
-  };
-
-  // ====== 핵심: product-info 호출해 화면 반영 ======
-  async function fillProductInfo(url, appendRaw){
-    try{
-      const r = await fetch(ENDPOINT_INFO, {
-        method:"POST", headers:{ "Content-Type":"application/json" },
-        body: JSON.stringify({ url })
-      });
-      const txt = await r.text(); let j; try{ j=JSON.parse(txt);}catch{ j=null; }
-      if (appendRaw) $raw.textContent += "\n\n--- product-info ---\n" + (txt || "(empty)");
-
-      if (!j?.success) throw new Error(j?.error || "product-info 실패");
-
-      const title = j.title ?? "";
-      const price = Number.isFinite(j.price) ? fmt(j.price) : "-"; // ← 백엔드의 '최저가(정수)'를 원화 표기로
-      if (title) $pname.textContent = title;
-      if (price) $pprice.textContent = price;
-
-      setTpl();
-    }catch(e){
-      const msg = String(e?.message || e);
-      if (msg.includes("429") || msg.includes("concurrency")) setErr("요청이 많습니다. 잠시 후 다시 시도해주세요.");
-      else setErr(msg);
+exports.handler = async (event) => {
+  try {
+    if (event.httpMethod === "OPTIONS") {
+      return { statusCode: 200, headers: CORS, body: "" };
     }
+    if (event.httpMethod !== "POST") {
+      return { statusCode: 405, headers: CORS, body: "POST only" };
+    }
+
+    const { url } = JSON.parse(event.body || "{}");
+    if (!url) {
+      return json({ success: false, error: "No URL provided" });
+    }
+
+    const finalUrl = await normalizeUrl(url);
+    const html = await getFastestHtml(finalUrl);
+    const parsed = parseInfo(html) || {};
+
+    return json({
+      success: true,
+      finalUrl,
+      title: parsed.title ?? null,
+      price: parsed.price ?? null,
+      currency: parsed.currency ?? "KRW",
+      provider: parsed.provider ?? null,
+    });
+  } catch (err) {
+    return json({ success: false, error: String(err && err.message || err) });
+  }
+};
+
+function json(obj, code = 200) {
+  return {
+    statusCode: code,
+    headers: { "Content-Type": "application/json", ...CORS },
+    body: JSON.stringify(obj),
+  };
+}
+
+// URL 정규화: 짧은링크 해제 + 추적 파라미터 제거 + canonical 경로
+async function normalizeUrl(input) {
+  let u = input.trim();
+
+  if (u.includes("link.coupang.com")) {
+    const r = await fetch(u, { method: "HEAD", redirect: "manual" });
+    const loc = r.headers.get("location");
+    if (loc) u = loc;
   }
 
-  // 콘솔/북마클릿에서 즉시 채우기용 공개 함수
-  window.fillFromApi = async (input) => {
-    const url = normalize((String(input||"").match(/https?:\/\/[^\s]+/)||[])[0] || input);
-    $inp.value = url;
-    await fillProductInfo(url, true);
-  };
+  const url = new URL(u);
+  [
+    "redirect","src","addtag","itime","lptag","wTime","wPcid","wRef","traceid",
+    "pageType","pageValue","spec","ctag","mcid","placementid","clickBeacon",
+    "campaignid","puidType","contentcategory","imgsize","pageid","tsource",
+    "deviceid","token","contenttype","subid","sig","impressionid","campaigntype",
+    "puid","requestid","ctime","contentkeyword","portal","landing_exp","subparam"
+  ].forEach(p => url.searchParams.delete(p));
 
-  // 초기 렌더
-  setTpl();
-  updateCopyLinkButton();
-});
-</script>
-</body>
-</html>
+  const m = url.pathname.match(/\/(vp\/)?products\/(\d+)/);
+  return m ? https://www.coupang.com/vp/products/${m[2]} : url.toString();
+}
+
+// 병렬 시도: 데스크톱/모바일, 렌더/비렌더
+async function getFastestHtml(finalUrl) {
+  const attempts = [
+    () => scrapeWithScrapingBee(finalUrl, 6500, desktopHeaders(), true),
+    () => scrapeWithScrapingBee(finalUrl, 6500, mobileHeaders(), true),
+    () => scrapeWithScrapingBee(finalUrl, 2500, desktopHeaders(), false),
+  ];
+  const settled = await Promise.allSettled(attempts.map(fn => fn()));
+  const ok = settled.find(r => r.status === "fulfilled");
+  if (ok) return ok.value;
+
+  const reasons = settled
+    .map(r => r.status === "rejected" ? String(r.reason) : "")
+    .filter(Boolean);
+  throw new Error("All attempts failed: " + reasons.join(" | "));
+}
+
+function desktopHeaders() {
+  return {
+    "User-Agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+  };
+}
+function mobileHeaders() {
+  return {
+    "User-Agent":
+      "Mozilla/5.0 (Linux; Android 13; SM-S908N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+  };
+}
+
+// ScrapingBee 호출
+async function scrapeWithScrapingBee(url, timeoutMs, headers, render = true) {
+  const apiKey = process.env.SCRAPINGBEE_KEY;
+  if (!apiKey) throw new Error("Missing SCRAPINGBEE_KEY");
+
+  const params = {
+    api_key: apiKey,
+    url,
+    render_js: render ? "true" : "false",
+    ...(process.env.SCRAPINGBEE_PREMIUM === "1" ? { premium_proxy: "true" } : {}),
+    country_code: "kr",
+    ...(render
+      ? { wait_for: 'meta[property="og:title"], script[type="application/ld+json"]' }
+      : {}),
+    forward_headers: "true",
+  };
+  const qs = new URLSearchParams(params);
+
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  const res = await fetch(https://app.scrapingbee.com/api/v1?${qs}, {
+    method: "GET",
+    headers,
+    signal: ctrl.signal,
+  }).finally(() => clearTimeout(t));
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(ScrapingBee ${res.status} ${body});
+  }
+  return res.text();
+}
+
+// HTML 파싱
+function parseInfo(html) {
+  // JSON-LD (배열 / @graph 포함)
+  const ldBlocks = [...html.matchAll(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/g)]
+    .map(m => { try { return JSON.parse(m[1]); } catch { return null; } })
+    .filter(Boolean)
+    .flatMap(o => Array.isArray(o) ? o : (o['@graph'] ? o['@graph'] : [o]));
+
+  const prod = ldBlocks.find(o =>
+    (o['@type'] === 'Product' || o['@type']?.includes?.('Product') || o.name)
+  );
+  if (prod) {
+    const offers = Array.isArray(prod.offers) ? prod.offers[0] : prod.offers;
+    const price = offers?.price ?? offers?.lowPrice ?? null;
+    const currency = offers?.priceCurrency ?? 'KRW';
+    if (prod.name) return {
+      title: prod.name,
+      price: price ? String(price) : null,
+      currency,
+      provider: 'json-ld'
+    };
+  }
+
+  // og:title
+  const og = html.match(/<meta property="og:title" content="([^"]+)"/)
+    || html.match(/<meta name="title" content="([^"]+)"/);
+  if (og?.[1]) {
+    const price = pickPriceFallback(html);
+    return { title: og[1], price: price || null, currency: 'KRW', provider: 'meta' };
+  }
+
+  // __NUXT__
+  const nuxt = html.match(/window\.__NUXT__\s*=\s*(\{[\s\S]*?\});/);
+  if (nuxt) try {
+    const obj = JSON.parse(nuxt[1]);
+    const s = JSON.stringify(obj);
+    const title = s.match(/"productName"\s*:\s*"([^"]+)"/)?.[1]
+               || s.match(/"name"\s*:\s*"([^"]+)"/)?.[1] || null;
+    const price = s.match(/"salePrice"\s*:\s*("?[\d,\.]+"?)/)?.[1]
+               || s.match(/"price"\s*:\s*("?[\d,\.]+"?)/)?.[1] || null;
+    return {
+      title,
+      price: price?.replace(/[^0-9.]/g, '') || null,
+      currency: 'KRW',
+      provider: '__NUXT__'
+    };
+  } catch {}
+
+  return { title: null, price: null, currency: 'KRW', provider: 'none' };
+}
+
+function pickPriceFallback(html) {
+  const m =
+    html.match(/"salePrice"\s*:\s*("?[\d,\.]+"?)/) ||
+    html.match(/"price"\s*:\s*("?[\d,\.]+"?)/) ||
+    html.match(/data-price="([\d\.]+)"/);
+  return m?.[1]?.replace(/[^0-9.]/g, '') || null;
+}
