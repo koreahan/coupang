@@ -1,6 +1,6 @@
 // netlify/functions/product-info.js
-// POST 전용. 짧은링크 해제 → 모바일 페이지 시도 → 데스크탑 페이지 시도
-// 모든 실패도 200으로 응답 + reason 포함 (프런트 흐름 유지)
+// POST 전용: 짧은링크 해제 → (입력 URL 선추출) productId → 렌더링된 HTML 파싱(title/price)
+// 실패해도 200으로 { success:false, reason } 반환하여 프런트 흐름 유지
 
 const MOBILE_UA =
   "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1";
@@ -8,7 +8,7 @@ const DESKTOP_UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15";
 
 const COMMON_HEADERS = {
-  "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+  "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8",
   "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
   "Cache-Control": "no-cache",
   "Pragma": "no-cache",
@@ -19,6 +19,12 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type",
+};
+
+const ENV = {
+  SCRAPINGBEE_KEY: process.env.SCRAPINGBEE_KEY,
+  ZYTE_API_KEY: process.env.ZYTE_API_KEY,
+  SCRAPFLY_KEY: process.env.SCRAPFLY_KEY,
 };
 
 exports.handler = async (event) => {
@@ -34,77 +40,210 @@ exports.handler = async (event) => {
   }
 
   try {
-    const { url } = JSON.parse(event.body || "{}");
-    if (!url) {
-      return json200({ success: false, reason: "Missing 'url' in body." });
+    const { url: inputUrl } = JSON.parse(event.body || "{}");
+    if (!inputUrl) return json200({ success: false, reason: "Missing 'url' in body." });
+
+    // (A) 입력 URL에서 먼저 productId 선추출 (리다이렉트 전에!)
+    let ex = extractProductId(inputUrl);
+
+    // (B) 짧은링크/리다이렉트 해제
+    const { finalUrl, hops } = await resolveShortUrl(inputUrl);
+
+    // (C) 선추출 실패 시 최종 URL에서 재시도
+    if (!ex?.productId) ex = extractProductId(finalUrl);
+
+    // (D) 그래도 없으면 HTML에서 productId 폴백 탐색
+    if (!ex?.productId) {
+      const provider0 = pickProvider();
+      if (!provider0) {
+        return json200({
+          success: false,
+          reason: "No scraping provider configured and URL has no productId.",
+          originalUrl: inputUrl,
+          finalUrl,
+          hops,
+        });
+      }
+      try {
+        const htmlForId = await fetchRenderedHtml(provider0, finalUrl, DESKTOP_UA, 8000);
+        const discoveredId = discoverProductIdFromHtml(htmlForId);
+        if (discoveredId) ex = { productId: discoveredId };
+      } catch { /* ignore */ }
     }
 
-    // 1) 짧은링크 해제 (HEAD 우선, 불가하면 GET with redirect: 'manual')
-    const { finalUrl, hops, resolveReason } = await resolveShortUrl(url);
-
-    // 2) productId 추출
-    const { productId } = extractProductId(finalUrl) || {};
-    if (!productId) {
+    if (!ex?.productId) {
       return json200({
         success: false,
-        reason: `Cannot extract productId. ${resolveReason ? "(" + resolveReason + ")" : ""}`,
-        originalUrl: url,
+        reason: "Cannot extract productId from input/final URL or page HTML.",
+        originalUrl: inputUrl,
         finalUrl,
         hops,
       });
     }
 
-    // 3) 모바일 페이지 시도
-    const mobileUrl = toMobileUrl(finalUrl, productId);
-    const mobileTry = await tryFetchProduct(mobileUrl, "mobile");
-
-    if (mobileTry.success) {
+    // (E) 본문 수집: 데스크탑 → 모바일 순으로 렌더링 HTML 요청
+    const provider = pickProvider();
+    if (!provider) {
       return json200({
-        success: true,
-        source: "mobile",
-        originalUrl: url,
+        success: false,
+        reason: "No scraping provider configured.",
+        originalUrl: inputUrl,
         finalUrl,
         hops,
-        productId,
-        title: mobileTry.title || null,
-        price: mobileTry.price || null,
-        currency: mobileTry.currency || "KRW",
-        raw: mobileTry.rawPicked ? undefined : undefined, // 의도적 미노출
+        productId: ex.productId,
       });
     }
 
-    // 4) 데스크탑 페이지 시도
-    const desktopUrl = toDesktopUrl(finalUrl, productId);
-    const desktopTry = await tryFetchProduct(desktopUrl, "desktop");
+    const desktopUrl = toDesktopUrl(finalUrl, ex.productId);
+    const mobileUrl = toMobileUrl(finalUrl, ex.productId);
 
-    if (desktopTry.success) {
+    let html = null;
+    let source = null;
+    let lastErr = null;
+
+    for (const [tryUrl, ua, label] of [
+      [desktopUrl, DESKTOP_UA, "desktop"],
+      [mobileUrl, MOBILE_UA, "mobile"],
+    ]) {
+      try {
+        html = await fetchRenderedHtml(provider, tryUrl, ua, 9000);
+        source = label;
+        if (html && html.length > 1500) break;
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+
+    if (!html) {
       return json200({
-        success: true,
-        source: "desktop",
-        originalUrl: url,
+        success: false,
+        reason: `Rendered HTML fetch failed (${provider.name})` + (lastErr ? `: ${safeMsg(lastErr)}` : ""),
+        originalUrl: inputUrl,
         finalUrl,
         hops,
-        productId,
-        title: desktopTry.title || null,
-        price: desktopTry.price || null,
-        currency: desktopTry.currency || "KRW",
+        productId: ex.productId,
       });
     }
 
-    // 5) 모두 실패: 그래도 200 + reason 반환
+    // (F) 파싱 (title / price)
+    const title = pickOg(html, "og:title") || pickMetaName(html, "title") || pickTitleTag(html);
+    const priceInfo = pickPrice(html);
+    const price = priceInfo?.price ?? null;
+    const currency = priceInfo?.currency ?? "KRW";
+
+    if (!title && !price) {
+      return json200({
+        success: false,
+        reason: "Parse failed (no title/price found).",
+        originalUrl: inputUrl,
+        finalUrl,
+        hops,
+        productId: ex.productId,
+        source,
+      });
+    }
+
     return json200({
-      success: false,
-      reason: `Parse failed. mobile: ${mobileTry.reason} / desktop: ${desktopTry.reason}`,
-      originalUrl: url,
+      success: true,
+      provider: provider.name,
+      source,
+      originalUrl: inputUrl,
       finalUrl,
       hops,
-      productId,
+      productId: ex.productId,
+      title: title || null,
+      price: typeof price === "number" ? price : null,
+      currency,
     });
   } catch (err) {
-    // 예외도 200으로 랩핑
-    return json200({ success: false, reason: `Exception: ${err.message || String(err)}` });
+    return json200({ success: false, reason: `Exception: ${safeMsg(err)}` });
   }
 };
+
+/* ------------------------ providers ------------------------ */
+
+function pickProvider() {
+  if (ENV.SCRAPINGBEE_KEY) return { name: "scrapingbee", fetch: fetchViaScrapingBee };
+  if (ENV.ZYTE_API_KEY) return { name: "zyte", fetch: fetchViaZyte };
+  if (ENV.SCRAPFLY_KEY) return { name: "scrapfly", fetch: fetchViaScrapfly };
+  return null;
+}
+
+async function fetchRenderedHtml(provider, url, userAgent, timeoutMs = 9000) {
+  return provider.fetch(url, userAgent, timeoutMs);
+}
+
+// ScrapingBee
+async function fetchViaScrapingBee(url, userAgent, timeoutMs) {
+  const endpoint = new URL("https://app.scrapingbee.com/api/v1/");
+  endpoint.searchParams.set("api_key", process.env.SCRAPINGBEE_KEY);
+  endpoint.searchParams.set("url", url);
+  endpoint.searchParams.set("render_js", "true");
+  endpoint.searchParams.set("wait", "2000");
+  endpoint.searchParams.set("block_resources", "false");
+  const res = await fetchWithTimeout(endpoint.toString(), {
+    method: "GET",
+    headers: { "X-User-Agent": userAgent },
+  }, timeoutMs);
+  if (res.status >= 400) throw new Error(`ScrapingBee HTTP ${res.status}`);
+  return await res.text();
+}
+
+// Zyte API
+async function fetchViaZyte(url, userAgent, timeoutMs) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch("https://api.zyte.com/v1/extract", {
+      method: "POST",
+      headers: {
+        "Authorization": "Bearer " + process.env.ZYTE_API_KEY,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        url,
+        browserHtml: true,
+        httpResponseBody: true,
+        browser: { userAgent },
+        actions: [{ type: "wait", duration: 2.0 }],
+      }),
+      signal: controller.signal,
+    });
+    if (res.status >= 400) throw new Error(`Zyte HTTP ${res.status}`);
+    const data = await res.json();
+    if (data.browserHtml) return data.browserHtml;
+    if (data.httpResponseBody) {
+      try { return Buffer.from(data.httpResponseBody, "base64").toString("utf8"); } catch {}
+    }
+    throw new Error("Zyte: empty body");
+  } finally {
+    clearTimeout(id);
+  }
+}
+
+// Scrapfly
+async function fetchViaScrapfly(url, userAgent, timeoutMs) {
+  const endpoint = new URL("https://api.scrapfly.io/scrape");
+  endpoint.searchParams.set("key", process.env.SCRAPFLY_KEY);
+  endpoint.searchParams.set("url", url);
+  endpoint.searchParams.set("render_js", "true");
+  endpoint.searchParams.set("country", "kr");
+  endpoint.searchParams.set("asp", "true");
+  endpoint.searchParams.set("wait_for", "2000");
+
+  const res = await fetchWithTimeout(endpoint.toString(), {
+    method: "GET",
+    headers: { "X-Scrapfly-User-Agent": userAgent },
+  }, timeoutMs);
+  if (res.status >= 400) throw new Error(`Scrapfly HTTP ${res.status}`);
+
+  const ct = res.headers.get("content-type") || "";
+  if (ct.includes("application/json")) {
+    const j = await res.json();
+    return j?.result?.content || j?.content || "";
+  }
+  return await res.text();
+}
 
 /* ------------------------ helpers ------------------------ */
 
@@ -115,9 +254,7 @@ function json200(obj) {
 async function resolveShortUrl(startUrl) {
   let current = startUrl;
   const hops = [current];
-  let reason = "";
 
-  // 최대 4회 hop, 각 요청 타임아웃 짧게(1.5s)
   for (let i = 0; i < 4; i++) {
     const head = await fetchWithTimeout(current, {
       method: "HEAD",
@@ -133,7 +270,6 @@ async function resolveShortUrl(startUrl) {
       continue;
     }
 
-    // 일부 서버가 HEAD 미지원 → 최소 GET(1바이트 범위)로 시도
     if (!head || head.status === 405 || head.status === 400) {
       const get = await fetchWithTimeout(current, {
         method: "GET",
@@ -149,43 +285,27 @@ async function resolveShortUrl(startUrl) {
         continue;
       }
     }
-
-    // 더 이상 수동 리디렉트 없음 → 종료
     break;
   }
-
-  // 쿠팡 도메인 normalize
-  try {
-    const u = new URL(current);
-    if (u.hostname.endsWith("link.coupang.com")) {
-      reason = "Short link not fully resolved to coupang.com";
-    }
-  } catch (_) {}
-
-  return { finalUrl: current, hops, resolveReason: reason };
+  return { finalUrl: current, hops };
 }
 
 function extractProductId(u) {
   try {
-    const url = new URL(u);
-    // 일반 패턴: /vp/products/:productId
-    const m = url.pathname.match(/\/vp\/products\/(\d+)/);
+    const p = new URL(u).pathname;
+    let m = p.match(/\/vp\/products\/(\d+)/i);
     if (m) return { productId: m[1] };
-
-    // 다른 패턴 대비(안전장치): /products/:id
-    const m2 = url.pathname.match(/\/products\/(\d+)/);
-    if (m2) return { productId: m2[1] };
-
+    m = p.match(/\/np\/products\/(\d+)/i);
+    if (m) return { productId: m[1] };
+    m = p.match(/\/products\/(\d+)/i);
+    if (m) return { productId: m[1] };
     return null;
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 
 function toMobileUrl(u, productId) {
   const url = new URL(u);
   url.hostname = "m.coupang.com";
-  // 모바일 상세 기본 경로도 /vp/products 유지되는 케이스가 많음
   url.pathname = `/vp/products/${productId}`;
   return url.toString();
 }
@@ -197,34 +317,20 @@ function toDesktopUrl(u, productId) {
   return url.toString();
 }
 
-async function tryFetchProduct(u, mode /* 'mobile' | 'desktop' */) {
-  const ua = mode === "mobile" ? MOBILE_UA : DESKTOP_UA;
-  const timeoutMs = 4500; // 이전 대비 타임아웃 단축
-
-  const res = await fetchWithTimeout(u, {
-    method: "GET",
-    redirect: "follow",
-    headers: { ...COMMON_HEADERS, "User-Agent": ua },
-  }, timeoutMs).catch((e) => ({ _error: e }));
-
-  if (!res || res._error) {
-    return { success: false, reason: `fetch timeout or network error (${mode})` };
-  }
-
-  if (res.status >= 400) {
-    return { success: false, reason: `HTTP ${res.status} (${mode})` };
-  }
-
-  const html = await res.text();
-  // 간단/견고 파서: og:title, og:price:amount or JSON-LD offers.price
-  const title = pickOg(html, "og:title") || pickMetaName(html, "title") || pickTitleTag(html);
-  const { price, currency } = pickPrice(html) || {};
-
-  if (!title && !price) {
-    return { success: false, reason: `parse failed (${mode})` };
-  }
-
-  return { success: true, title, price, currency: currency || "KRW" };
+function discoverProductIdFromHtml(html) {
+  if (!html) return null;
+  let m;
+  m = html.match(/href=["'][^"']*\/vp\/products\/(\d+)[^"']*["']/i);
+  if (m) return m[1];
+  m = html.match(/href=["'][^"']*\/products\/(\d+)[^"']*["']/i);
+  if (m) return m[1];
+  m = html.match(/https?:\/\/(?:www\.)?coupang\.com\/vp\/products\/(\d+)/i);
+  if (m) return m[1];
+  m = html.match(/https?:\/\/(?:www\.)?coupang\.com\/products\/(\d+)/i);
+  if (m) return m[1];
+  m = html.match(/productId["']?\s*[:=]\s*["']?(\d{6,})["']?/i);
+  if (m) return m[1];
+  return null;
 }
 
 function pickOg(html, property) {
@@ -243,30 +349,29 @@ function pickTitleTag(html) {
 }
 
 function pickPrice(html) {
-  // 1) og:price:amount
   const ogPrice = pickOg(html, "product:price:amount") || pickOg(html, "og:price:amount");
   const ogCurrency = pickOg(html, "product:price:currency") || pickOg(html, "og:price:currency");
   if (ogPrice) return { price: toNumber(ogPrice), currency: ogCurrency || "KRW" };
 
-  // 2) JSON-LD offers.price
   const jsonLdBlocks = [...html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)].map(m => m[1]);
   for (const block of jsonLdBlocks) {
     try {
       const data = JSON.parse(block);
-      const offers = Array.isArray(data) ? data.flatMap(x => x.offers ? [x.offers] : []) : (data.offers ? [data.offers] : []);
-      for (const off of offers) {
-        if (!off) continue;
-        if (typeof off.price === "number" || typeof off.price === "string") {
-          return { price: toNumber(off.price), currency: off.priceCurrency || "KRW" };
+      const arr = Array.isArray(data) ? data : [data];
+      for (const node of arr) {
+        const offers = node?.offers;
+        const arrOffers = Array.isArray(offers) ? offers : offers ? [offers] : [];
+        for (const off of arrOffers) {
+          if (off && (typeof off.price === "number" || typeof off.price === "string")) {
+            return { price: toNumber(off.price), currency: off.priceCurrency || "KRW" };
+          }
         }
       }
     } catch {}
   }
 
-  // 3) fallback: 페이지 내 숫자 패턴(원 단위) heuristic
   const wonMatch = html.match(/([0-9][0-9,]{3,})\s*(?:원|KRW)/);
   if (wonMatch) return { price: toNumber(wonMatch[1]), currency: "KRW" };
-
   return null;
 }
 
@@ -274,7 +379,6 @@ function toNumber(v) {
   if (typeof v === "number") return v;
   return Number(String(v).replace(/[^\d.]/g, ""));
 }
-
 function escapeRe(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -295,4 +399,8 @@ async function fetchWithTimeout(url, options, ms) {
   } finally {
     clearTimeout(id);
   }
+}
+
+function safeMsg(e) {
+  try { return e?.message || String(e); } catch { return "error"; }
 }
