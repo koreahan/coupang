@@ -1,230 +1,180 @@
 // netlify/functions/product-info.js
-const http = require("http");
-const https = require("https");
+// 역할: 쿠팡 원본/짧은 링크를 받아 상품명(name)과 가격(price)을 반환
+// 주의: create-deeplink.js는 건드리지 않습니다 (딥링크는 기존 로직 그대로)
+
 const axios = require("axios");
 
-/** Keep-Alive agents to reduce latency */
-const agentHttp = new http.Agent({ keepAlive: true, maxSockets: 50, keepAliveMsecs: 10000 });
-const agentHttps = new https.Agent({ keepAlive: true, maxSockets: 50, keepAliveMsecs: 10000 });
-const AX = axios.create({
-  timeout: 12000,
-  httpAgent: agentHttp,
-  httpsAgent: agentHttps,
-  decompress: true,
-  headers: { "Accept-Encoding": "gzip, deflate, br" }
-});
-
-/** Extract first http(s) URL from arbitrary text */
-function extractFirstUrl(input) {
-  if (!input) return "";
-  const m = String(input).match(/https?:\/\/[^\s]+/);
-  return m ? m[0] : "";
-}
-
-/** Resolve link.coupang.com / coupa.ng short links (HEAD -> (optional) GET) */
-async function resolveShort(inputUrl, fast=false) {
-  const isShort = /^https?:\/\/(link\.coupang\.com|coupa\.ng)\//i.test(inputUrl);
+// 짧은 링크 해제 (link.coupang.com, coupa.ng 등)
+async function resolveShortIfNeeded(inputUrl, timeoutMs) {
+  const isShort =
+    /^https?:\/\/(link\.coupang\.com|coupa\.ng)\//i.test(inputUrl);
   if (!isShort) return inputUrl;
+
   let cur = inputUrl;
+  for (let i = 0; i < 5; i++) {
+    const r = await axios
+      .head(cur, {
+        maxRedirects: 0,
+        validateStatus: (s) => s >= 200 && s < 400,
+        timeout: timeoutMs,
+      })
+      .catch((e) => e?.response);
 
-  // Try HEAD first
-  const h = await AX.head(cur, {
-    maxRedirects: 0,
-    validateStatus: s => s >= 200 && s < 400
-  }).catch(e => e?.response);
+    if (!r) break;
+    const loc = r.headers?.location;
+    if (!loc) break;
+    cur = new URL(loc, cur).toString();
 
-  let loc = h?.headers?.location;
-  if (loc) return new URL(loc, cur).toString();
-
-  if (fast) return cur; // fast 모드면 여기서 종료 (느려짐 방지)
-
-  // Fallback GET once
-  const g = await AX.get(cur, {
-    maxRedirects: 0,
-    validateStatus: s => s >= 200 && s < 400
-  }).catch(e => e?.response);
-
-  loc = g?.headers?.location;
-  return loc ? new URL(loc, cur).toString() : cur;
+    // 원본 상품 도메인으로 오면 종료
+    if (/^https?:\/\/(www\.)?coupang\.com\//i.test(cur)) return cur;
+  }
+  return cur; // 못 풀어도 일단 반환
 }
 
-/** Fetch HTML (mobile first -> desktop fallback) */
-const UA_MOBILE =
-  "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1";
-const UA_DESKTOP =
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15";
-
-async function fetchHtml(url, fast=false) {
-  // Mobile first
-  try {
-    const mUrl = url.replace("://www.", "://m.");
-    const { data } = await AX.get(mUrl, {
-      timeout: fast ? 8000 : 12000,
-      headers: {
-        "User-Agent": UA_MOBILE,
-        "Referer": "https://m.coupang.com/",
-        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Accept": "text/html,application/xhtml+xml"
-      },
-      responseType: "text"
-    });
-    if (typeof data === "string" && data) return { html: data, from: "m" };
-  } catch {}
-
-  if (fast) return { html: "", from: "m" }; // fast면 폴백 생략
-
-  const wUrl = url.replace("://m.", "://www.");
-  const { data } = await AX.get(wUrl, {
-    timeout: 12000,
-    headers: {
-      "User-Agent": UA_DESKTOP,
-      "Referer": "https://www.coupang.com/",
-      "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-      "Accept": "text/html,application/xhtml+xml"
-    },
-    responseType: "text"
-  });
-  return { html: data, from: "www" };
+// www.coupang.com URL에서 productId 추출
+function extractProductId(url) {
+  const m = url.match(/\/products\/(\d+)/);
+  return m ? m[1] : null;
 }
 
-const toInt = (s) => {
-  if (s == null) return null;
-  const m = String(s).replace(/[^\d]/g, "");
-  return m ? parseInt(m, 10) : null;
-};
+// 모바일 상품페이지에서 이름/가격 파싱
+async function fetchProductInfo(productId, timeoutMs) {
+  const mobileUrl = `https://m.coupang.com/vp/products/${productId}`;
+  const html = (await axios.get(mobileUrl, { timeout: timeoutMs })).data;
 
-function parseNamePrice(html) {
+  // 1) 상품명: og:title 또는 JSON 영역
   let name = null;
-
-  // Name candidates
-  const og = html.match(/<meta\s+property=["']og:title["']\s+content=["']([^"']+)["']/i);
+  const og = html.match(
+    /<meta\s+property=["']og:title["']\s+content=["']([^"']+)["']/i
+  );
   if (og) name = og[1];
+
   if (!name) {
-    const pn = html.match(/"productName"\s*:\s*"([^"]+)"/i);
-    if (pn) name = pn[1];
+    const m = html.match(/"productName"\s*:\s*"([^"]+)"/i);
+    if (m) name = m[1];
   }
-  if (!name) {
-    const tt = html.match(/<title>([^<]+)<\/title>/i);
-    if (tt) name = tt[1];
+
+  // 2) 가격: 가능한 키들에서 숫자 수집 → 최솟값 사용
+  const prices = [];
+  const priceRegex =
+    /"(salePrice|discountedPrice|price|unitPrice|originPrice)"\s*:\s*(\d{2,})/gi;
+  let mm;
+  while ((mm = priceRegex.exec(html)) !== null) {
+    const v = parseInt(mm[2], 10);
+    if (Number.isFinite(v)) prices.push(v);
   }
-  if (name) name = name.replace(/\s*\|.*$/, "").trim();
+  const price = prices.length ? Math.min(...prices) : null;
 
-  // Price candidates
-  const nums = [];
-  const keyRx = /"(finalPrice|salePrice|discountedPrice|discountPrice|originPrice|price|unitPrice|wowPrice|minPrice|maxPrice|pcPrice|mobilePrice)"\s*:\s*(\d{2,})/gi;
-  let m;
-  while ((m = keyRx.exec(html)) !== null) {
-    const v = parseInt(m[2], 10);
-    if (Number.isFinite(v)) nums.push(v);
-  }
-  const metaAmt = html.match(/<meta[^>]+property=["']og:product:price:amount["'][^>]+content=["']([^"']+)["']/i);
-  if (metaAmt) nums.push(toInt(metaAmt[1]));
-  const domStrong = html.match(/<span[^>]*class=["'][^"']*(?:total-price|sale|price)[^"']*["'][^>]*>\s*<strong[^>]*>([^<]+)<\/strong>/i);
-  if (domStrong) nums.push(toInt(domStrong[1]));
-  const domPlain = html.match(/<span[^>]*class=["'][^"']*prod-price__price[^"']*["'][^>]*>([^<]+)<\/span>/i);
-  if (domPlain) nums.push(toInt(domPlain[1]));
-
-  const candidates = nums.filter(n => Number.isFinite(n) && n > 0);
-  const price = candidates.length ? Math.min(...candidates) : null;
-
-  return { name: name || null, price: price ?? null };
+  return { name, price, productId, mobileUrl };
 }
 
 exports.handler = async (event) => {
-  const isOptions = event.httpMethod === "OPTIONS";
-  if (isOptions) {
-    return {
-      statusCode: 200,
-      headers: {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Headers": "Content-Type",
-        "Access-Control-Allow-Methods": "POST, OPTIONS"
-      },
-      body: ""
-    };
-  }
-
+  // GET으로 열어보면 405 (정상)
   if (event.httpMethod !== "POST") {
     return {
       statusCode: 405,
-      headers: { "Access-Control-Allow-Origin": "*" },
-      body: JSON.stringify({ success:false, error:{ code:"METHOD_NOT_ALLOWED", message:"POST only" } })
+      body: JSON.stringify({
+        success: false,
+        error: { code: "METHOD_NOT_ALLOWED", message: "POST only" },
+      }),
     };
   }
 
+  // fast=1 이면 타임아웃 짧게
   const qs = event.queryStringParameters || {};
-  const fast = qs.fast === "1";
-  const debug = qs.debug === "1";
+  const timeoutMs = qs.fast === "1" ? 3500 : 7000;
 
+  // body 파싱
   let url = "";
   try {
     const body = JSON.parse(event.body || "{}");
-    url = extractFirstUrl((body.url || "").trim());
+    url = String(body.url || "").trim();
   } catch {
     return {
       statusCode: 400,
-      headers: { "Access-Control-Allow-Origin": "*" },
-      body: JSON.stringify({ success:false, error:{ code:"BAD_JSON", message:"Invalid JSON body" } })
+      body: JSON.stringify({
+        success: false,
+        error: { code: "BAD_JSON", message: "Invalid JSON body" },
+      }),
     };
   }
+
   if (!url) {
     return {
       statusCode: 400,
-      headers: { "Access-Control-Allow-Origin": "*" },
-      body: JSON.stringify({ success:false, error:{ code:"URL_REQUIRED", message:"Valid URL required" } })
+      body: JSON.stringify({
+        success: false,
+        error: { code: "URL_REQUIRED", message: "url required" },
+      }),
     };
   }
 
-  // Resolve short link
+  // 1) 짧은 → 원본으로
   let finalUrl = url;
-  try { finalUrl = await resolveShort(url, fast); } catch {}
+  try {
+    finalUrl = await resolveShortIfNeeded(url, timeoutMs);
+  } catch (e) {
+    return {
+      statusCode: 502,
+      body: JSON.stringify({
+        success: false,
+        error: { code: "RESOLVE_FAILED", message: String(e?.message || e) },
+        input: { url, finalUrl: null },
+      }),
+    };
+  }
 
-  // Only coupang domain
-  if (!/^https?:\/\/(?:www\.|m\.)?coupang\.com\//i.test(finalUrl)) {
+  if (!/^https?:\/\/(www\.)?coupang\.com\//i.test(finalUrl)) {
     return {
       statusCode: 400,
-      headers: { "Access-Control-Allow-Origin": "*" },
-      body: JSON.stringify({ success:false, error:{ code:"INVALID_URL", message:"쿠팡 상품 URL이 아닙니다." }, input:{ url, finalUrl } })
+      body: JSON.stringify({
+        success: false,
+        error: {
+          code: "INVALID_URL",
+          message: "쿠팡 상품 원본 URL이 아닙니다.",
+        },
+        input: { url, finalUrl },
+      }),
     };
   }
 
+  // 2) productId 추출
+  const productId = extractProductId(finalUrl);
+  if (!productId) {
+    return {
+      statusCode: 400,
+      body: JSON.stringify({
+        success: false,
+        error: { code: "NO_PRODUCT_ID", message: "productId 추출 실패" },
+        input: { url, finalUrl },
+      }),
+    };
+  }
+
+  // 3) 모바일 페이지에서 파싱
   try {
-    const { html, from } = await fetchHtml(finalUrl, fast);
-    if (!html) {
-      return {
-        statusCode: 502,
-        headers: { "Access-Control-Allow-Origin": "*" },
-        body: JSON.stringify({ success:false, error:{ code:"FETCH_FAILED", message:"상품 페이지를 불러오지 못했습니다." }, input:{ url, finalUrl } })
-      };
-    }
-
-    const info = parseNamePrice(html);
-    const detail = debug ? {
-      hasOgTitle: /property=["']og:title/.test(html),
-      hasProductNameKey: /"productName"\s*:/.test(html),
-      sample: html.slice(0, 1500)
-    } : undefined;
-
+    const info = await fetchProductInfo(productId, timeoutMs);
     return {
       statusCode: 200,
-      headers: { "Access-Control-Allow-Origin": "*" },
       body: JSON.stringify({
         success: true,
         info: {
-          name: info.name,
-          price: info.price,
-          formattedPrice: Number.isFinite(info.price) ? info.price.toLocaleString("ko-KR") + "원" : null
+          name: info.name || null,
+          price: Number.isFinite(info.price) ? info.price : null,
+          productId: info.productId,
+          sourceUrl: finalUrl,
+          mobileUrl: info.mobileUrl,
         },
-        source: from,
-        input: { url, finalUrl },
-        detail
-      })
+      }),
     };
   } catch (e) {
     return {
       statusCode: 502,
-      headers: { "Access-Control-Allow-Origin": "*" },
-      body: JSON.stringify({ success:false, error:{ code:"PARSE_FAILED", message:String(e?.message || e) }, input:{ url, finalUrl } })
+      body: JSON.stringify({
+        success: false,
+        error: { code: "FETCH_FAILED", message: String(e?.message || e) },
+        input: { url, finalUrl, productId },
+      }),
     };
   }
 };
