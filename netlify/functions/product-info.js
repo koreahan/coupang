@@ -1,4 +1,5 @@
-// Netlify Function (성능 최적화 버전)
+// Netlify Function v1 (Node 18+)
+// 쿠팡 상품명/가격 추출 API
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
@@ -20,16 +21,8 @@ exports.handler = async (event) => {
     }
 
     const finalUrl = await normalizeUrl(url);
-
-    // 1단계: 빠른 비렌더링 스크래핑 시도
-    let html = await getFastestHtml(finalUrl, { render: false, timeout: 5000 });
-    let parsed = parseInfo(html) || {};
-
-    // 2단계: 1단계에서 가격을 찾지 못했다면 느린 렌더링 스크래핑 시도
-    if (parsed.price === null) {
-      html = await getFastestHtml(finalUrl, { render: true, timeout: 15000, premium: true });
-      parsed = parseInfo(html) || parsed;
-    }
+    const html = await getFastestHtml(finalUrl);
+    const parsed = parseInfo(html) || {};
 
     return json({
       success: true,
@@ -52,13 +45,16 @@ function json(obj, code = 200) {
   };
 }
 
+// URL 정규화: 짧은링크 해제 + 추적 파라미터 제거 + canonical 경로
 async function normalizeUrl(input) {
   let u = input.trim();
+
   if (u.includes("link.coupang.com")) {
     const r = await fetch(u, { method: "HEAD", redirect: "manual" });
     const loc = r.headers.get("location");
     if (loc) u = loc;
   }
+
   const url = new URL(u);
   [
     "redirect","src","addtag","itime","lptag","wTime","wPcid","wRef","traceid",
@@ -67,27 +63,26 @@ async function normalizeUrl(input) {
     "deviceid","token","contenttype","subid","sig","impressionid","campaigntype",
     "puid","requestid","ctime","contentkeyword","portal","landing_exp","subparam"
   ].forEach(p => url.searchParams.delete(p));
+
   const m = url.pathname.match(/\/(vp\/)?products\/(\d+)/);
   return m ? `https://www.coupang.com/vp/products/${m[2]}` : url.toString();
 }
 
-// 순차 시도: 비렌더(빠른) → 렌더(느린)
-async function getFastestHtml(finalUrl, options) {
+// 병렬 시도: 데스크톱/모바일, 렌더/비렌더
+async function getFastestHtml(finalUrl) {
   const attempts = [
-    { timeout: 2500, headers: desktopHeaders(), render: false },
-    { timeout: 6500, headers: mobileHeaders(), render: true, premium: true },
-    { timeout: 6500, headers: desktopHeaders(), render: true, premium: false },
+    () => scrapeWithScrapingBee(finalUrl, 6500, desktopHeaders(), true),
+    () => scrapeWithScrapingBee(finalUrl, 6500, mobileHeaders(), true),
+    () => scrapeWithScrapingBee(finalUrl, 2500, desktopHeaders(), false),
   ];
+  const settled = await Promise.allSettled(attempts.map(fn => fn()));
+  const ok = settled.find(r => r.status === "fulfilled");
+  if (ok) return ok.value;
 
-  for (const step of attempts) {
-    try {
-      return await scrapeWithScrapingBee(finalUrl, step.timeout, step.headers, step.render, step.premium);
-    } catch (e) {
-      console.warn(`스크래핑 시도 실패: ${e.message}. 다음 단계로 넘어갑니다.`);
-    }
-  }
-
-  throw new Error("모든 스크래핑 시도가 실패했습니다.");
+  const reasons = settled
+    .map(r => r.status === "rejected" ? String(r.reason) : "")
+    .filter(Boolean);
+  throw new Error("All attempts failed: " + reasons.join(" | "));
 }
 
 function desktopHeaders() {
@@ -105,7 +100,8 @@ function mobileHeaders() {
   };
 }
 
-async function scrapeWithScrapingBee(url, timeoutMs, headers, render = true, premium = false) {
+// ScrapingBee 호출
+async function scrapeWithScrapingBee(url, timeoutMs, headers, render = true) {
   const apiKey = process.env.SCRAPINGBEE_KEY;
   if (!apiKey) throw new Error("Missing SCRAPINGBEE_KEY");
 
@@ -113,7 +109,7 @@ async function scrapeWithScrapingBee(url, timeoutMs, headers, render = true, pre
     api_key: apiKey,
     url,
     render_js: render ? "true" : "false",
-    ...(premium ? { premium_proxy: "true" } : {}),
+    ...(process.env.SCRAPINGBEE_PREMIUM === "1" ? { premium_proxy: "true" } : {}),
     country_code: "kr",
     ...(render
       ? { wait_for: 'meta[property="og:title"], script[type="application/ld+json"]' }
@@ -137,6 +133,7 @@ async function scrapeWithScrapingBee(url, timeoutMs, headers, render = true, pre
   return res.text();
 }
 
+// HTML 파싱 (최저가 검색 로직 보강)
 function parseInfo(html) {
   const prices = [];
   let title = null, currency = "KRW", provider = "none";
@@ -152,6 +149,7 @@ function parseInfo(html) {
     }
   };
 
+  // 1. JSON-LD 파싱
   const ldBlocks = [...html.matchAll(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/g)]
     .map(m => { try { return JSON.parse(m[1]); } catch { return null; } })
     .filter(Boolean)
@@ -173,6 +171,7 @@ function parseInfo(html) {
     });
   }
 
+  // 2. og:title 파싱
   const og = html.match(/<meta property="og:title" content="([^"]+)"/)
     || html.match(/<meta name="title" content="([^"]+)"/);
   if (!title && og?.[1]) {
@@ -180,6 +179,7 @@ function parseInfo(html) {
     provider = provider === 'none' ? 'meta' : provider;
   }
 
+  // 3. __NUXT__ 내부 파싱
   const nuxt = html.match(/window\.__NUXT__\s*=\s*(\{[\s\S]*?\});/);
   if (nuxt) try {
     const s = nuxt[1];
@@ -191,6 +191,7 @@ function parseInfo(html) {
     provider = provider === 'none' ? '__NUXT__' : provider;
   } catch {}
 
+  // 4. HTML 전역 후보 파싱
   const pricePatterns = [
     /class="total-price[^"]*">[\s\S]*?([\d,.]+)\s*원/gi,
     /class="prod-price[^"]*">[\s\S]*?([\d,.]+)\s*원/gi,
