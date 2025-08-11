@@ -37,9 +37,8 @@ async function normalizeUrl(input){
   
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-// 렌더링을 포함한 느린 스크래핑 로직
 async function getFastestHtml(finalUrl) {
-    const step = { render: true, timeout: 15000, premium: true }; // 느리지만 정확하게
+    const step = { render: true, timeout: 15000, premium: true };
 
     try {
         const html = await scrapeWithScrapingBee(finalUrl, step);
@@ -123,6 +122,8 @@ function parseInfo(html){
       /aria-label="가격\s*([\d,.]+)\s*원"/gi,
       /data-price="([\d,.]+)"/gi,
       /data-rt-price="([\d,.]+)"/gi,
+      /class="price">[\s\S]*?<strong>([\d,.]+)<\/strong>원/gi,
+      /content="product:price:amount"[\s\S]*?content="([\d,.]+)"/gi,
     ];
     if (prices.length === 0) {
       const fallbackPrices = new Set();
