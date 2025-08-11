@@ -38,29 +38,25 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
   
 async function getFastestHtml(finalUrl) {
     const ladder = [
-      { render: true, timeout: 15000, premium: true },
-      { render: true, timeout: 15000, premium: false },
-      { render: false, timeout: 8000, premium: false },
+        { render: false, timeout: 8000, premium: false }, // 렌더링 없이 빠른 시도 (가장 빠르고 안정적)
+        { render: true, timeout: 15000, premium: true }, // 실패 시, 프리미엄 프록시로 재시도
     ];
+
     let lastErr;
     for (const step of ladder) {
-      for (let i = 0; i < 2; i++) {
         try {
-          const html = await scrapeWithScrapingBee(finalUrl, step);
-          if (/Sorry!\s*Access\s*denied/i.test(html) || html.length < 2000) {
-            throw new Error('BLOCKED_PAGE');
-          }
-          return html;
+            const html = await scrapeWithScrapingBee(finalUrl, step);
+            if (/Sorry!\s*Access\s*denied/i.test(html) || html.length < 2000) {
+                throw new Error('BLOCKED_PAGE');
+            }
+            return html;
         } catch (e) {
-          lastErr = e;
-          const msg = String(e?.message || e);
-          if (msg.includes('HTTP_429')) {
-            await sleep(1000 * (i + 1));
-            continue;
-          }
-          break;
+            lastErr = e;
+            const msg = String(e?.message || e);
+            if (msg.includes('HTTP_429')) {
+                console.warn('ScrapingBee 429 에러 발생. 다음 스크래핑 단계로 넘어갑니다.');
+            }
         }
-      }
     }
     throw lastErr || new Error('All attempts failed');
 }
