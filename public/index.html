@@ -13,15 +13,18 @@
     input[type=text]{width:100%;padding:14px;border:1px solid #e5e7eb;border-radius:12px;font-size:16px}
     .btn{background:#111;color:#fff;border:0;border-radius:12px;padding:10px 14px;font-size:14px;cursor:pointer}
     .btn.secondary{background:#fff;color:#111;border:1px solid #e5e7eb}
+    .btn.small{padding:6px 10px;font-size:12px;border-radius:10px}
     .row{display:flex;gap:8px;flex-wrap:wrap}
+    .row-between{display:flex;align-items:center;justify-content:space-between;gap:8px}
     .out{background:#fafafa;border:1px solid #e5e7eb;border-radius:12px;padding:12px;min-height:40px;font-size:14px;word-break:break-all}
     .error{color:#b00020;background:#fff1f1;border:1px solid #f3c2c2;padding:10px 12px;border-radius:10px;font-size:13px}
     pre{white-space:pre-wrap;word-break:break-all;background:#f9fafb;border:1px solid #e5e7eb;border-radius:12px;padding:12px;font-size:12px;max-height:320px;overflow:auto}
     .badge{position:fixed;top:8px;left:8px;background:#111;color:#fff;padding:4px 8px;border-radius:8px;font:12px/1.4 system-ui;z-index:9999}
+    .muted{color:#666;font-size:12px}
   </style>
 </head>
 <body>
-  <div class="badge">BUILD public/index.html · total</div>
+  <div class="badge">BUILD public/index.html · link-copy</div>
   <div class="wrap">
     <div class="card">
       <h1>쿠팡 딥링크 · 자동 채움</h1>
@@ -36,8 +39,12 @@
 
       <div id="err" class="error" style="display:none;margin-top:10px"></div>
 
-      <label style="margin-top:14px">파트너스 링크</label>
+      <div class="row-between" style="margin-top:14px">
+        <label style="margin:0">파트너스 링크</label>
+        <button id="btnCopyLink" class="btn secondary small" disabled>링크 복사</button>
+      </div>
       <div id="deeplink" class="out">(아직 없음)</div>
+      <div class="muted">* 링크가 생성되면 ‘링크 복사’ 버튼이 활성화됩니다.</div>
 
       <div class="row" style="margin-top:10px">
         <div style="flex:1;min-width:220px">
@@ -69,6 +76,7 @@
   const $ = id => document.getElementById(id);
   const $inp = $("inp"), $err = $("err"), $raw = $("raw");
   const $deeplink = $("deeplink"), $pname = $("pname"), $pprice = $("pprice"), $tpl = $("tpl");
+  const $btnCopyLink = $("btnCopyLink");
 
   const firstUrl = s => (String(s||"").match(/https?:\/\/[^\s]+/)||[])[0] || "";
   const fmt = n => Number(n||0).toLocaleString("ko-KR")+"원";
@@ -90,15 +98,21 @@
     return { ok:res.ok, status:res.status, json, text };
   };
 
+  function updateCopyLinkButton() {
+    const link = $deeplink.textContent?.trim();
+    const valid = link && !link.startsWith("(");
+    $btnCopyLink.disabled = !valid;
+  }
+
   $("btnGo").onclick = async () => {
     setErr(""); $raw.textContent="(요청 중...)";
-    $deeplink.textContent="(생성 중...)"; $pname.textContent="-"; $pprice.textContent="-"; setTpl();
+    $deeplink.textContent="(생성 중...)"; $pname.textContent="-"; $pprice.textContent="-"; updateCopyLinkButton(); setTpl();
 
     const url = firstUrl($inp.value);
-    if(!url){ setErr("쿠팡 링크를 입력하세요."); $deeplink.textContent="(아직 없음)"; return; }
+    if(!url){ setErr("쿠팡 링크를 입력하세요."); $deeplink.textContent="(아직 없음)"; updateCopyLinkButton(); return; }
 
     try{
-      // 1) 딥링크 먼저 (응답 실패 사유는 RAW에 남김)
+      // 1) 딥링크
       const deep = await postJSON(ENDPOINT_DEEP, { url });
       $raw.textContent = deep.text;
       if (!deep.json || deep.json.success === false) {
@@ -106,8 +120,9 @@
       }
       const link = deep.json.deeplink || deep.json.link || "";
       $deeplink.textContent = link || "(생성 실패)";
+      updateCopyLinkButton();
 
-      // 2) 상품 정보 (최대 8초 대기, 실패해도 템플릿은 링크만으로 생성)
+      // 2) 상품정보 (최대 8초 대기, 실패 무시)
       const ctrl = new AbortController(); const to = setTimeout(()=>ctrl.abort(), 8000);
       try{
         const r = await fetch(ENDPOINT_INFO, {
@@ -121,7 +136,7 @@
           if (j.info?.name)  $pname.textContent  = j.info.name;
           if (Number.isFinite(j.info?.price)) $pprice.textContent = fmt(j.info.price);
         }
-      }catch(_){ /* timeouts ignored */ }
+      }catch(_){ /* ignore */ }
 
     }catch(e){
       setErr(e?.message || String(e));
@@ -135,7 +150,18 @@
     alert("복사되었습니다.");
   };
 
+  $btnCopyLink.onclick = async () => {
+    const link = $deeplink.textContent?.trim();
+    if (!link || link.startsWith("(")) return;
+    await navigator.clipboard.writeText(link);
+    // 간단 피드백
+    const prev = $btnCopyLink.textContent;
+    $btnCopyLink.textContent = "복사됨!";
+    setTimeout(()=>{ $btnCopyLink.textContent = prev; }, 1200);
+  };
+
   setTpl();
+  updateCopyLinkButton();
 </script>
 </body>
 </html>
