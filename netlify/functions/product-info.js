@@ -1,55 +1,37 @@
-// netlify/functions/product-info.js
-// Node 18+ (fetch 내장). Netlify v1 handler.
-// ScrapingBee 병렬 시도 + 데스크톱/모바일 URL 동시 시도 + 견고한 파싱 + 400 방지 + iOS CORS.
-
+// Netlify Function v1 (Node 18+)
+// 쿠팡 상품명/가격 추출 API
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With",
-  "Access-Control-Max-Age": "86400",
-  "Vary": "Origin",
-  "Cache-Control": "no-store"
+  "Access-Control-Allow-Headers": "Content-Type",
 };
-
-const DEBUG = process.env.DEBUG === "true";
 
 exports.handler = async (event) => {
   try {
     if (event.httpMethod === "OPTIONS") {
-      return { statusCode: 204, headers: CORS, body: "" };
+      return { statusCode: 200, headers: CORS, body: "" };
     }
     if (event.httpMethod !== "POST") {
       return { statusCode: 405, headers: CORS, body: "POST only" };
     }
 
     const { url } = JSON.parse(event.body || "{}");
-    if (!url) return json({ success: false, error: "No URL provided" });
+    if (!url) {
+      return json({ success: false, error: "No URL provided" });
+    }
 
     const finalUrl = await normalizeUrl(url);
-    const html = await getFastestHtml(finalUrl); // 데스크톱/모바일, 렌더/비렌더 병렬
-
+    const html = await getFastestHtml(finalUrl);
     const parsed = parseInfo(html) || {};
-    const payload = {
+
+    return json({
       success: true,
       finalUrl,
       title: parsed.title ?? null,
       price: parsed.price ?? null,
       currency: parsed.currency ?? "KRW",
       provider: parsed.provider ?? null,
-    };
-
-    if (DEBUG && !parsed.title && !parsed.price) {
-      payload.debug = {
-        htmlLength: html?.length || 0,
-        hasOg: /<meta property="og:title"/.test(html),
-        ldCount: (html.match(/<script type="application\/ld\+json">/g) || []).length,
-        hasNuxt: /window\.__NUXT__\s*=/.test(html),
-        hasNext: /id="__NEXT_DATA__"/.test(html),
-        hasProdDom: /\.prod-buy-header__title|\.total-price|#prod-detail/.test(html)
-      };
-    }
-
-    return json(payload);
+    });
   } catch (err) {
     return json({ success: false, error: String(err && err.message || err) });
   }
@@ -63,11 +45,10 @@ function json(obj, code = 200) {
   };
 }
 
-/* ---------------- URL 정규화 ---------------- */
+// URL 정규화: 짧은링크 해제 + 추적 파라미터 제거 + canonical 경로
 async function normalizeUrl(input) {
   let u = input.trim();
 
-  // 쿠팡 파트너스 짧은링크 서버에서 해제
   if (u.includes("link.coupang.com")) {
     const r = await fetch(u, { method: "HEAD", redirect: "manual" });
     const loc = r.headers.get("location");
@@ -77,45 +58,31 @@ async function normalizeUrl(input) {
   const url = new URL(u);
   [
     "redirect","src","addtag","itime","lptag","wTime","wPcid","wRef","traceid",
-    "pageType","pageValue","spec","ctag","mcid","placementid","clickBeacon","campaignid",
-    "puidType","contentcategory","imgsize","pageid","tsource","deviceid","token","contenttype",
-    "subid","sig","impressionid","campaigntype","puid","requestid","ctime","contentkeyword",
-    "portal","landing_exp","subparam"
+    "pageType","pageValue","spec","ctag","mcid","placementid","clickBeacon",
+    "campaignid","puidType","contentcategory","imgsize","pageid","tsource",
+    "deviceid","token","contenttype","subid","sig","impressionid","campaigntype",
+    "puid","requestid","ctime","contentkeyword","portal","landing_exp","subparam"
   ].forEach(p => url.searchParams.delete(p));
 
   const m = url.pathname.match(/\/(vp\/)?products\/(\d+)/);
-  const desktop = m ? `https://www.coupang.com/vp/products/${m[2]}` : url.toString();
-  const mobile  = m ? `https://m.coupang.com/vp/products/${m[2]}` : desktop;
-
-  return { desktop, mobile, id: m ? m[2] : null, toString(){ return desktop; } };
+  return m ? `https://www.coupang.com/vp/products/${m[2]}` : url.toString();
 }
 
-/* ---------------- 병렬 시도(데스크톱+모바일) ---------------- */
-async function getFastestHtml(finalUrlObj) {
-  const { desktop, mobile } = typeof finalUrlObj === 'string'
-    ? { desktop: finalUrlObj, mobile: toMobile(finalUrlObj) }
-    : finalUrlObj;
-
+// 병렬 시도: 데스크톱/모바일, 렌더/비렌더
+async function getFastestHtml(finalUrl) {
   const attempts = [
-    // 데스크톱 렌더링/비렌더
-    () => scrapeWithScrapingBee(desktop, 9000, desktopHeaders(), true),
-    () => scrapeWithScrapingBee(desktop, 3000, desktopHeaders(), false),
-    // 모바일 렌더링/비렌더
-    () => scrapeWithScrapingBee(mobile, 9000, mobileHeaders(), true),
-    () => scrapeWithScrapingBee(mobile, 3000, mobileHeaders(), false),
+    () => scrapeWithScrapingBee(finalUrl, 6500, desktopHeaders(), true),
+    () => scrapeWithScrapingBee(finalUrl, 6500, mobileHeaders(), true),
+    () => scrapeWithScrapingBee(finalUrl, 2500, desktopHeaders(), false),
   ];
-
-  const results = await Promise.allSettled(attempts.map(fn => fn()));
-  const ok = results.find(r => r.status === "fulfilled");
+  const settled = await Promise.allSettled(attempts.map(fn => fn()));
+  const ok = settled.find(r => r.status === "fulfilled");
   if (ok) return ok.value;
 
-  const reasons = results.filter(r => r.status === "rejected").map(r => String(r.reason));
+  const reasons = settled
+    .map(r => r.status === "rejected" ? String(r.reason) : "")
+    .filter(Boolean);
   throw new Error("All attempts failed: " + reasons.join(" | "));
-}
-
-function toMobile(desktopUrl) {
-  try { const u = new URL(desktopUrl); u.hostname = "m.coupang.com"; return u.toString(); }
-  catch { return desktopUrl; }
 }
 
 function desktopHeaders() {
@@ -123,7 +90,6 @@ function desktopHeaders() {
     "User-Agent":
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
     "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
   };
 }
 function mobileHeaders() {
@@ -131,51 +97,33 @@ function mobileHeaders() {
     "User-Agent":
       "Mozilla/5.0 (Linux; Android 13; SM-S908N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36",
     "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
   };
 }
 
-/* ---------------- ScrapingBee 호출 ---------------- */
+// ScrapingBee 호출
 async function scrapeWithScrapingBee(url, timeoutMs, headers, render = true) {
   const apiKey = process.env.SCRAPINGBEE_KEY;
   if (!apiKey) throw new Error("Missing SCRAPINGBEE_KEY");
 
-  // 렌더링 시에만 wait/selector 추가. 빈 값은 절대 전송하지 않음(400 방지)
   const params = {
     api_key: apiKey,
     url,
     render_js: render ? "true" : "false",
-    premium_proxy: "true",
+    ...(process.env.SCRAPINGBEE_PREMIUM === "1" ? { premium_proxy: "true" } : {}),
     country_code: "kr",
+    ...(render
+      ? { wait_for: 'meta[property="og:title"], script[type="application/ld+json"]' }
+      : {}),
     forward_headers: "true",
-    ...(render ? {
-      wait: "networkidle",
-      // JSON‑LD, OG, Next.js, Nuxt, 그리고 쿠팡 DOM 핵심 요소까지 대기
-      wait_for: [
-        'meta[property="og:title"]',
-        'script[type="application/ld+json"]',
-        '#__NEXT_DATA__',
-        'script#__NEXT_DATA__',
-        '.prod-buy-header__title',
-        '.total-price',
-        '#prod-detail'
-      ].join(','),
-      js_scenario: 'return true;',
-    } : {})
   };
-
-  const qs = new URLSearchParams();
-  for (const [k, v] of Object.entries(params)) {
-    if (v !== undefined && v !== null && String(v).trim() !== "") qs.append(k, v);
-  }
+  const qs = new URLSearchParams(params);
 
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
-
   const res = await fetch(`https://app.scrapingbee.com/api/v1?${qs}`, {
     method: "GET",
     headers,
-    signal: ctrl.signal
+    signal: ctrl.signal,
   }).finally(() => clearTimeout(t));
 
   if (!res.ok) {
@@ -185,145 +133,61 @@ async function scrapeWithScrapingBee(url, timeoutMs, headers, render = true) {
   return res.text();
 }
 
-/* ---------------- 파싱 로직(강화) ---------------- */
+// HTML 파싱
 function parseInfo(html) {
-  // 1) JSON‑LD(Product) — 배열/@graph 지원
+  // JSON-LD (배열 / @graph 포함)
   const ldBlocks = [...html.matchAll(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/g)]
     .map(m => { try { return JSON.parse(m[1]); } catch { return null; } })
-    .filter(Boolean);
+    .filter(Boolean)
+    .flatMap(o => Array.isArray(o) ? o : (o['@graph'] ? o['@graph'] : [o]));
 
-  const flatten = (node) => {
-    if (!node) return [];
-    if (Array.isArray(node)) return node.flatMap(flatten);
-    if (node['@graph']) return flatten(node['@graph']);
-    return [node];
-  };
-  const ldFlat = ldBlocks.flatMap(flatten);
-
-  const product = ldFlat.find(o =>
-    (o['@type'] && String(o['@type']).toLowerCase().includes('product')) ||
-    (o.name && (o.offers || o.price || o.brand))
+  const prod = ldBlocks.find(o =>
+    (o['@type'] === 'Product' || o['@type']?.includes?.('Product') || o.name)
   );
-
-  if (product) {
-    const title = product.name || product.headline || null;
-    const offers = product.offers && (Array.isArray(product.offers) ? product.offers[0] : product.offers);
-    let price = offers?.price ?? offers?.lowPrice ?? product.price ?? null;
-    if (typeof price === 'string') {
-      const m = price.replace(/[^\d.]/g,'').match(/\d+(?:\.\d+)?/);
-      price = m ? m[0] : null;
-    }
-    const currency = offers?.priceCurrency || product.priceCurrency || 'KRW';
-    if (title || price) return { title: title ?? null, price: price ?? null, currency, provider: 'json-ld' };
-  }
-
-  // 2) OG
-  const og = html.match(/<meta property="og:title" content="([^"]+)"/);
-  if (og?.[1]) {
-    const p = pickPriceFallback(html);
-    return { title: og[1], price: p, currency: "KRW", provider: "og" };
-  }
-
-  // 3) __NUXT__ (Nuxt)
-  const nuxt = html.match(/window\.__NUXT__\s*=\s*(\{[\s\S]*?\});/);
-  if (nuxt) try {
-    const s = JSON.stringify(JSON.parse(nuxt[1]));
-    const price = (s.match(/"priceSales"\s*:\s*"?([\d,]+)"?/)?.[1]) ||
-                  (s.match(/"salePrice"\s*:\s*"?([\d,]+)"?/)?.[1]) ||
-                  (s.match(/"discountedPrice"\s*:\s*"?([\d,]+)"?/)?.[1]) ||
-                  (s.match(/"buyPrice"\s*:\s*"?([\d,]+)"?/)?.[1]) ||
-                  (s.match(/"price"\s*:\s*"?([\d,]+)"?/)?.[1]) || null;
-    const title = (s.match(/"displayProductName"\s*:\s*"([^"]+)"/)?.[1]) ||
-                  (s.match(/"productName"\s*:\s*"([^"]+)"/)?.[1]) ||
-                  (s.match(/"name"\s*:\s*"([^"]+)"/)?.[1]) || null;
-    const normPrice = price ? price.replace(/[^\d]/g,'') : null;
-    if (title || normPrice) return { title, price: normPrice, currency: "KRW", provider: "__NUXT__" };
-  } catch {}
-
-  // 4) __NEXT_DATA__ (Next.js)
-  const nextTag = html.match(/<script[^>]*id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
-  if (nextTag) {
-    try {
-      const data = JSON.parse(nextTag[1]);
-      const s = JSON.stringify(data);
-      const title = (s.match(/"displayProductName"\s*:\s*"([^"]+)"/)?.[1]) ||
-                    (s.match(/"productName"\s*:\s*"([^"]+)"/)?.[1]) ||
-                    (s.match(/"name"\s*:\s*"([^"]+)"/)?.[1]) || null;
-      const price = (s.match(/"priceSales"\s*:\s*"?([\d,]+)"?/)?.[1]) ||
-                    (s.match(/"salePrice"\s*:\s*"?([\d,]+)"?/)?.[1]) ||
-                    (s.match(/"discountedPrice"\s*:\s*"?([\d,]+)"?/)?.[1]) ||
-                    (s.match(/"buyPrice"\s*:\s*"?([\d,]+)"?/)?.[1]) ||
-                    (s.match(/"price"\s*:\s*"?([\d,]+)"?/)?.[1]) || null;
-      const normPrice = price ? price.replace(/[^\d]/g,'') : null;
-      if (title || normPrice) return { title, price: normPrice, currency: "KRW", provider: "__NEXT_DATA__" };
-    } catch {}
-  }
-
-  // 5) DOM 기반(데스크톱 쿠팡)
-  const h2 = html.match(/<h2[^>]*class="[^"]*\bprod-buy-header__title\b[^"]*"[^>]*>([\s\S]*?)<\/h2>/i);
-  const domTitle = h2?.[1]?.replace(/<[^>]*>/g,'')?.replace(/\s+/g,' ').trim();
-  const priceDom = html.match(/<span[^>]*class="[^"]*\btotal-price\b[^"]*"[^>]*>([\s\S]*?)<\/span>/i);
-  const domPrice = priceDom?.[1]?.replace(/<[^>]*>/g,'')?.replace(/[^\d]/g,'') || null;
-  if (domTitle || domPrice) {
-    return { title: domTitle || null, price: domPrice || null, currency: "KRW", provider: "dom" };
-  }
-
-  // 6) meta price 백업
-  const metaPrice =
-    html.match(/<meta[^>]+itemprop="price"[^>]+content="([\d,]+)"/i) ||
-    html.match(/<meta[^>]+property="product:price:amount"[^>]+content="([\d,]+)"/i);
-  if (metaPrice?.[1]) {
-    const t = og?.[1] || extractTitleTag(html);
-    return { title: t || null, price: metaPrice[1].replace(/[^\d]/g,''), currency: "KRW", provider: "meta" };
-  }
-
-  // 7) 일반 키 백업
-  const genericTitle =
-    html.match(/"displayProductName"\s*:\s*"([^"]+)"/)?.[1] ||
-    html.match(/"productName"\s*:\s*"([^"]+)"/)?.[1] ||
-    html.match(/"name"\s*:\s*"([^"]+)"/)?.[1] || null;
-
-  const genericPrice =
-    html.match(/"priceSales"\s*:\s*"?([\d,]+)"?/)?.[1] ||
-    html.match(/"buyPrice"\s*:\s*"?([\d,]+)"?/)?.[1] ||
-    html.match(/"salePrice"\s*:\s*"?([\d,]+)"?/)?.[1] ||
-    html.match(/"price"\s*:\s*"?([\d,]+)"?/)?.[1] ||
-    html.match(/data-price="([\d,]+)"/)?.[1] || null;
-
-  if (genericTitle || genericPrice) {
-    return {
-      title: genericTitle || null,
-      price: genericPrice ? genericPrice.replace(/[^\d]/g,'') : null,
-      currency: "KRW",
-      provider: "generic"
+  if (prod) {
+    const offers = Array.isArray(prod.offers) ? prod.offers[0] : prod.offers;
+    const price = offers?.price ?? offers?.lowPrice ?? null;
+    const currency = offers?.priceCurrency ?? 'KRW';
+    if (prod.name) return {
+      title: prod.name,
+      price: price ? String(price) : null,
+      currency,
+      provider: 'json-ld'
     };
   }
 
-  // 8) <title> 최종 백업
-  const ttl = extractTitleTag(html);
-  if (ttl) {
-    return { title: ttl, price: pickPriceFallback(html), currency: "KRW", provider: "title" };
+  // og:title
+  const og = html.match(/<meta property="og:title" content="([^"]+)"/)
+    || html.match(/<meta name="title" content="([^"]+)"/);
+  if (og?.[1]) {
+    const price = pickPriceFallback(html);
+    return { title: og[1], price: price || null, currency: 'KRW', provider: 'meta' };
   }
 
-  return { title: null, price: null, currency: "KRW", provider: "none" };
+  // __NUXT__
+  const nuxt = html.match(/window\.__NUXT__\s*=\s*(\{[\s\S]*?\});/);
+  if (nuxt) try {
+    const obj = JSON.parse(nuxt[1]);
+    const s = JSON.stringify(obj);
+    const title = s.match(/"productName"\s*:\s*"([^"]+)"/)?.[1]
+               || s.match(/"name"\s*:\s*"([^"]+)"/)?.[1] || null;
+    const price = s.match(/"salePrice"\s*:\s*("?[\d,\.]+"?)/)?.[1]
+               || s.match(/"price"\s*:\s*("?[\d,\.]+"?)/)?.[1] || null;
+    return {
+      title,
+      price: price?.replace(/[^0-9.]/g, '') || null,
+      currency: 'KRW',
+      provider: '__NUXT__'
+    };
+  } catch {}
+
+  return { title: null, price: null, currency: 'KRW', provider: 'none' };
 }
 
 function pickPriceFallback(html) {
   const m =
-    html.match(/"priceSales"\s*:\s*"?([\d,]+)"?/) ||
-    html.match(/"discountedPrice"\s*:\s*"?([\d,]+)"?/) ||
-    html.match(/"salePrice"\s*:\s*"?([\d,]+)"?/) ||
-    html.match(/"buyPrice"\s*:\s*"?([\d,]+)"?/) ||
-    html.match(/"price"\s*:\s*"?([\d,]+)"?/) ||
-    html.match(/data-price="([\d,]+)"/);
-  const v = m?.[1]?.replace(/[^\d]/g,'');
-  return v || null;
-}
-
-function extractTitleTag(html){
-  const m = html.match(/<title>([\s\S]*?)<\/title>/i);
-  if (!m) return null;
-  let t = m[1].replace(/\s+/g,' ').trim();
-  t = t.replace(/\|?\s*쿠팡!?/g,'').replace(/:\s*로켓배송.*$/,'').trim();
-  return t || null;
+    html.match(/"salePrice"\s*:\s*("?[\d,\.]+"?)/) ||
+    html.match(/"price"\s*:\s*("?[\d,\.]+"?)/) ||
+    html.match(/data-price="([\d\.]+)"/);
+  return m?.[1]?.replace(/[^0-9.]/g, '') || null;
 }
