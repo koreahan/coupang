@@ -15,7 +15,6 @@
       <input id="inp" class="mt-2 w-full border rounded-xl p-3" placeholder="예) 쿠팡을 추천합니다! https://link.coupang.com/a/XXXXX" autocomplete="off" autocapitalize="off">
       <div class="mt-3 flex gap-2">
         <button id="go" class="px-4 py-2 rounded-xl bg-black text-white">딥링크 생성</button>
-        <button id="copyTpl" class="px-4 py-2 rounded-xl border" disabled>템플릿 복사</button>
       </div>
 
       <div id="err" class="mt-3 text-sm text-red-600 hidden"></div>
@@ -25,7 +24,7 @@
         <div id="deeplink" class="mt-1 text-sm break-all border rounded-xl p-3 bg-neutral-50 text-gray-500">(아직 없음)</div>
       </div>
 
-      <div class="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
+      <div class="mt-3 grid grid-cols-1 sm:grid-cols-3 gap-3">
         <div>
           <div class="text-sm text-gray-500">상품명 (자동)</div>
           <div id="pname" class="mt-1 border rounded-xl p-3 bg-neutral-50 text-gray-400">딥링크 생성 후 자동 채움</div>
@@ -34,102 +33,61 @@
           <div class="text-sm text-gray-500">가격(원, 자동)</div>
           <div id="pprice" class="mt-1 border rounded-xl p-3 bg-neutral-50 text-gray-400">딥링크 생성 후 자동 채움</div>
         </div>
+        <div>
+          <div class="text-sm text-gray-500">수량</div>
+          <input id="qty" value="1" class="mt-1 border rounded-xl p-3 bg-white" type="number" min="1">
+        </div>
+      </div>
+
+      <!-- 템플릿 미리보기 + 복사 -->
+      <div class="mt-4">
+        <div class="flex items-center justify-between">
+          <div class="text-sm text-gray-500">템플릿 미리보기</div>
+          <button id="copyTpl" class="px-3 py-2 rounded-lg border text-xs sm:text-sm">전체 복사</button>
+        </div>
+        <pre id="tpl" class="mt-2 bg-neutral-50 border rounded-xl p-3 text-sm whitespace-pre-wrap leading-7"></pre>
       </div>
 
       <details class="mt-4">
-        <summary class="text-sm text-gray-500 cursor-pointer">API 응답(JSON)</summary>
+        <summary class="text-sm text-gray-500 cursor-pointer">API 응답(raw JSON)</summary>
         <pre id="raw" class="mt-2 bg-neutral-50 border rounded-xl p-3 text-xs break-all">(없음)</pre>
       </details>
     </div>
   </div>
 
 <script>
-const ENDPOINT_DEEP = "/.netlify/functions/create-deeplink";       // 기존 딥링크 함수
-const ENDPOINT_INFO = "/.netlify/functions/product-info?fast=1";   // 서버 크롤링(이름/가격)
+const ENDPOINT_DEEP = "/.netlify/functions/create-deeplink";
+const ENDPOINT_INFO = "/.netlify/functions/product-info";
 
 const $ = (id) => document.getElementById(id);
-const $inp = $("inp"), $go = $("go"), $copy = $("copyTpl");
-const $err = $("err"), $raw = $("raw");
+const $inp = $("inp"), $go = $("go"), $qty = $("qty"), $copy = $("copyTpl");
+const $err = $("err"), $raw = $("raw"), $tpl = $("tpl");
 const $deeplink = $("deeplink"), $pname = $("pname"), $pprice = $("pprice");
+
+let pname = "", pprice = 0, deeplink = "";
 
 const extractFirstUrl = (s) => {
   const m = String(s||"").match(/https?:\/\/[^\s]+/);
   return m ? m[0] : "";
 };
-const fmt = (n) => {
-  const v = Number(n||0);
-  return isFinite(v)&&v>0 ? v.toLocaleString("ko-KR")+"원" : "";
-};
-const setError = (msg) => {
-  if (!msg) { $err.classList.add("hidden"); $err.textContent=""; return; }
-  $err.textContent = msg; $err.classList.remove("hidden");
-};
-const postJSON = async (url, body) => {
-  const res = await fetch(url, {
-    method:"POST", headers:{ "Content-Type":"application/json" },
-    body: JSON.stringify(body)
-  });
-  const txt = await res.text();
-  let j; try{ j=JSON.parse(txt);}catch{ j={ parseError:true, raw:txt }; }
-  return { ok:res.ok, status:res.status, json:j, text:txt };
-};
-const copy = (t) => navigator.clipboard.writeText(t);
 
-$go.onclick = async () => {
-  setError(""); $raw.textContent="(요청 중...)";
-  $go.disabled = true; $copy.disabled = true;
-
-  const url = extractFirstUrl($inp.value);
-  if (!url) { setError("쿠팡 상품 링크를 입력하세요."); $go.disabled=false; return; }
-
-  try {
-    // 1) 딥링크 생성 (짧은링크 로직 그대로 서버에 맡김)
-    const deep = await postJSON(ENDPOINT_DEEP, { url });
-    $raw.textContent = deep.text;
-    if (!deep.ok || deep.json?.success === false) {
-      throw new Error(deep.json?.error?.message || deep.json?.reason || ("HTTP "+deep.status));
-    }
-    const deeplink = deep.json.deeplink || deep.json.link || "";
-    $deeplink.textContent = deeplink || "(생성 실패)";
-    $deeplink.classList.toggle("text-gray-500", !deeplink);
-
-    // 2) 상품명/가격 자동 호출 (최대 3초, 느리면 포기)
-    const original = deep.json?.raw?.data?.[0]?.originalUrl || url;
-    const ctrl = new AbortController(); const t = setTimeout(()=>ctrl.abort(), 3000);
-    try {
-      const res = await fetch(ENDPOINT_INFO, {
-        method:"POST",
-        headers:{ "Content-Type":"application/json" },
-        body: JSON.stringify({ url: original }),
-        signal: ctrl.signal
-      });
-      clearTimeout(t);
-      const txt = await res.text();
-      let j; try{ j=JSON.parse(txt);}catch{ j=null; }
-      if (j?.success) {
-        if (j.info?.name) { $pname.textContent = j.info.name; $pname.classList.remove("text-gray-400"); }
-        if (Number.isFinite(j.info?.price)) { $pprice.textContent = fmt(j.info.price); $pprice.classList.remove("text-gray-400"); }
-      }
-    } catch(_) {/* timeout/에러면 무시 */}
-
-    // 3) 템플릿 복사
-    $copy.disabled = false;
-    $copy.onclick = async () => {
-      const tpl = `【쿠팡】${$pname.textContent || "상품명"}
-가격: ${$pprice.textContent || "가격정보"}
-링크: ${$deeplink.textContent || "쿠팡링크"}
+function updateTemplate() {
+  const qty = Number($qty.value) || 1;
+  const totalPrice = pprice * qty;
+  const formatted = (n) => n.toLocaleString("ko-KR");
+  $tpl.textContent =
+`【쿠팡】${pname || "상품명"}
+가격: ${pprice ? formatted(pprice) + "원" : "가격정보"}
+수량: ${qty}
+합계: ${totalPrice ? formatted(totalPrice) + "원" : "-"}
+링크: ${deeplink || "쿠팡링크"}
 
 ※ 모든 핫딜은 카드 할인 및 쿠폰 적용가 기준입니다.
 ※ 이 포스팅은 쿠팡파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받습니다. 구입 시 제품 가격에는 아무런 영향이 없습니다.`;
-      await copy(tpl); alert("복사되었습니다.");
-    };
+}
 
-  } catch(e) {
-    setError(e?.message || String(e));
-  } finally {
-    $go.disabled = false;
-  }
-};
-</script>
-</body>
-</html>
+$qty.addEventListener("input", updateTemplate);
+
+$go.addEventListener("click", async () => {
+  $err.classList.add("hidden");
+  $deeplink.textContent = "(생성 중...)
