@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>쿠팡 딥링크 · 점검판</title>
+  <title>쿠팡 딥링크 · 자동 채움</title>
   <style>
     body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,Apple SD Gothic Neo,Nanum Gothic,sans-serif;background:#f6f7f9;margin:0}
     .wrap{max-width:720px;margin:24px auto;padding:0 16px}
@@ -21,17 +21,16 @@
   </style>
 </head>
 <body>
-  <div class="badge">BUILD public/index.html · v-check</div>
+  <div class="badge">BUILD public/index.html · total</div>
   <div class="wrap">
     <div class="card">
-      <h1>쿠팡 딥링크 · 점검판</h1>
+      <h1>쿠팡 딥링크 · 자동 채움</h1>
 
       <label>문장 전체 붙여넣기 OK (첫 번째 http(s)만 인식)</label>
       <input id="inp" type="text" placeholder="예) 쿠팡을 추천합니다! https://link.coupang.com/a/XXXXX" autocomplete="off" autocapitalize="off" />
 
       <div class="row" style="margin-top:10px">
-        <button id="btnDeep" class="btn">딥링크 생성</button>
-        <button id="btnInfo" class="btn secondary">상품명/가격 가져오기</button>
+        <button id="btnGo" class="btn">딥링크 생성</button>
         <button id="btnCopy" class="btn secondary">템플릿 복사</button>
       </div>
 
@@ -62,23 +61,19 @@
   </div>
 
 <script>
-  // === 꼭 확인 ===
-  // Netlify와 같은 도메인에서 열면 빈 문자열("") 유지
-  // 다른 곳(깃허브 등)에서 연다면 "https://<네-넷리파이-도메인>"으로 바꿔쓰기
+  // 같은 Netlify 도메인에서 열면 "" 유지. 다른 도메인에서 열면 절대경로 기입
   const SITE_ORIGIN = ""; // 예: "https://coupanga.netlify.app"
+  const ENDPOINT_DEEP = SITE_ORIGIN + "/.netlify/functions/create-deeplink";
+  const ENDPOINT_INFO = SITE_ORIGIN + "/.netlify/functions/product-info";
 
-  const ENDPOINT_DEEP = SITE_ORIGIN + "/.netlify/functions/create-deeplink?debug=1";
-  const ENDPOINT_INFO = SITE_ORIGIN + "/.netlify/functions/product-info?fast=1";
-
-  const $ = (id) => document.getElementById(id);
+  const $ = id => document.getElementById(id);
   const $inp = $("inp"), $err = $("err"), $raw = $("raw");
   const $deeplink = $("deeplink"), $pname = $("pname"), $pprice = $("pprice"), $tpl = $("tpl");
 
-  const firstUrl = (s)=> (String(s||"").match(/https?:\/\/[^\s]+/)||[])[0] || "";
-  const fmt = (n)=> Number(n||0).toLocaleString("ko-KR")+"원";
-
-  function setErr(msg){ if(!msg){$err.style.display="none";$err.textContent="";return;} $err.style.display="block";$err.textContent=msg; }
-  function setTpl(){
+  const firstUrl = s => (String(s||"").match(/https?:\/\/[^\s]+/)||[])[0] || "";
+  const fmt = n => Number(n||0).toLocaleString("ko-KR")+"원";
+  const setErr = msg => { if(!msg){$err.style.display="none";$err.textContent="";return;} $err.style.display="block"; $err.textContent=msg; };
+  const setTpl = ()=>{
     const name = $pname.textContent && $pname.textContent !== "-" ? $pname.textContent : "상품명";
     const priceTxt = $pprice.textContent && $pprice.textContent !== "-" ? $pprice.textContent : "가격정보";
     const link = $deeplink.textContent && !$deeplink.textContent.startsWith("(") ? $deeplink.textContent : "쿠팡링크";
@@ -88,48 +83,51 @@
 
 ※ 모든 핫딜은 카드 할인 및 쿠폰 적용가 기준입니다.
 ※ 이 포스팅은 쿠팡파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받습니다. 구입 시 제품 가격에는 아무런 영향이 없습니다.`;
-  }
-
-  async function postJSON(url, body){
+  };
+  const postJSON = async (url, body)=>{
     const res = await fetch(url,{ method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(body) });
-    const text = await res.text();
-    let json; try{ json = JSON.parse(text); }catch{ json = { parseError:true, raw:text }; }
-    return { ok: res.ok, status: res.status, json, text };
-  }
-
-  $("btnDeep").onclick = async () => {
-    setErr(""); $raw.textContent = "(딥링크 요청 중...)";
-    const url = firstUrl($inp.value);
-    if(!url){ setErr("쿠팡 링크를 입력하세요."); return; }
-    try{
-      const r = await postJSON(ENDPOINT_DEEP, { url });
-      $raw.textContent = r.text;
-      if(!r.json || r.json.success === false){
-        throw new Error(r.json?.error?.message || r.json?.reason || ("HTTP "+r.status));
-      }
-      const deeplink = r.json.deeplink || r.json.link || "";
-      $deeplink.textContent = deeplink || "(생성 실패)";
-    }catch(e){
-      setErr(e?.message || String(e));
-    }finally{ setTpl(); }
+    const text = await res.text(); let json; try{ json=JSON.parse(text);}catch{ json={ parseError:true, raw:text }; }
+    return { ok:res.ok, status:res.status, json, text };
   };
 
-  $("btnInfo").onclick = async () => {
-    setErr(""); $raw.textContent = "(상품정보 요청 중...)";
+  $("btnGo").onclick = async () => {
+    setErr(""); $raw.textContent="(요청 중...)";
+    $deeplink.textContent="(생성 중...)"; $pname.textContent="-"; $pprice.textContent="-"; setTpl();
+
     const url = firstUrl($inp.value);
-    if(!url){ setErr("쿠팡 링크를 입력하세요."); return; }
+    if(!url){ setErr("쿠팡 링크를 입력하세요."); $deeplink.textContent="(아직 없음)"; return; }
+
     try{
-      const r = await postJSON(ENDPOINT_INFO, { url });
-      $raw.textContent = r.text;
-      if(r.json?.success){
-        if(r.json.info?.name){ $pname.textContent = r.json.info.name; }
-        if(Number.isFinite(r.json.info?.price)){ $pprice.textContent = fmt(r.json.info.price); }
-      }else{
-        throw new Error(r.json?.error?.message || r.json?.reason || ("HTTP "+r.status));
+      // 1) 딥링크 먼저 (응답 실패 사유는 RAW에 남김)
+      const deep = await postJSON(ENDPOINT_DEEP, { url });
+      $raw.textContent = deep.text;
+      if (!deep.json || deep.json.success === false) {
+        throw new Error(deep.json?.error?.message || deep.json?.reason || ("HTTP "+deep.status));
       }
+      const link = deep.json.deeplink || deep.json.link || "";
+      $deeplink.textContent = link || "(생성 실패)";
+
+      // 2) 상품 정보 (최대 8초 대기, 실패해도 템플릿은 링크만으로 생성)
+      const ctrl = new AbortController(); const to = setTimeout(()=>ctrl.abort(), 8000);
+      try{
+        const r = await fetch(ENDPOINT_INFO, {
+          method:"POST", headers:{ "Content-Type":"application/json" },
+          body: JSON.stringify({ url }), signal: ctrl.signal
+        });
+        clearTimeout(to);
+        const txt = await r.text(); let j; try{ j=JSON.parse(txt);}catch{ j=null; }
+        $raw.textContent += "\n\n--- product-info ---\n" + (txt || "(empty)");
+        if (j?.success) {
+          if (j.info?.name)  $pname.textContent  = j.info.name;
+          if (Number.isFinite(j.info?.price)) $pprice.textContent = fmt(j.info.price);
+        }
+      }catch(_){ /* timeouts ignored */ }
+
     }catch(e){
       setErr(e?.message || String(e));
-    }finally{ setTpl(); }
+    }finally{
+      setTpl();
+    }
   };
 
   $("btnCopy").onclick = async () => {
@@ -137,7 +135,6 @@
     alert("복사되었습니다.");
   };
 
-  // 초기 템플릿 표시
   setTpl();
 </script>
 </body>
