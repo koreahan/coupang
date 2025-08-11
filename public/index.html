@@ -12,6 +12,7 @@
     label{font-size:13px;color:#666;display:block;margin:12px 0 6px}
     input[type=text]{width:100%;padding:14px;border:1px solid #e5e7eb;border-radius:12px;font-size:16px}
     .btn{background:#111;color:#fff;border:0;border-radius:12px;padding:10px 14px;font-size:14px;cursor:pointer}
+    .btn[disabled]{opacity:.5;cursor:not-allowed}
     .btn.secondary{background:#fff;color:#111;border:1px solid #e5e7eb}
     .btn.small{padding:6px 10px;font-size:12px;border-radius:10px}
     .row{display:flex;gap:8px;flex-wrap:wrap}
@@ -77,7 +78,7 @@
   const $ = id => document.getElementById(id);
   const $inp = $("inp"), $err = $("err"), $raw = $("raw");
   const $deeplink = $("deeplink"), $pname = $("pname"), $pprice = $("pprice"), $tpl = $("tpl");
-  const $btnCopyLink = $("btnCopyLink");
+  const $btnCopyLink = $("btnCopyLink"), $btnGo = $("btnGo"), $btnInfo = $("btnInfo");
 
   const firstUrl = s => (String(s||"").match(/https?:\/\/[^\s]+/)||[])[0] || "";
   const fmt = n => Number(n||0).toLocaleString("ko-KR")+"원";
@@ -104,13 +105,32 @@
     $btnCopyLink.disabled = !valid;
   };
 
+  // ✅ 추가: 쿠팡 URL 정규화 (/products/ → /vp/products/)
+  const normalize = u => {
+    const m = String(u||"").match(/\/products\/(\d{6,})/);
+    return m ? `https://www.coupang.com/vp/products/${m[1]}` : u;
+  };
+
+  // ✅ 추가: 클릭 연타 방지
+  let _busy = false;
+  const withBusy = async (fn) => {
+    if (_busy) return;
+    _busy = true;
+    $btnGo.disabled = true; $btnInfo.disabled = true;
+    try { await fn(); } finally {
+      _busy = false;
+      $btnGo.disabled = false; $btnInfo.disabled = false;
+    }
+  };
+
   // 1) 딥링크 생성
-  $("btnGo").onclick = async () => {
+  $("btnGo").onclick = () => withBusy(async () => {
     setErr(""); $raw.textContent="(요청 중...)";
     $deeplink.textContent="(생성 중...)"; $pname.textContent="-"; $pprice.textContent="-"; updateCopyLinkButton(); setTpl();
 
-    const url = firstUrl($inp.value);
-    if(!url){ setErr("쿠팡 링크를 입력하세요."); $deeplink.textContent="(아직 없음)"; updateCopyLinkButton(); return; }
+    const url0 = firstUrl($inp.value);
+    if(!url0){ setErr("쿠팡 링크를 입력하세요."); $deeplink.textContent="(아직 없음)"; updateCopyLinkButton(); return; }
+    const url = normalize(url0);
 
     try{
       const deep = await postJSON(ENDPOINT_DEEP, { url });
@@ -129,14 +149,14 @@
     }finally{
       setTpl();
     }
-  };
+  });
 
   // 2) 상품정보 채우기 (수동 버튼)
-  $("btnInfo").onclick = async () => {
-    const url = firstUrl($inp.value);
-    if(!url){ setErr("쿠팡 링크를 입력하세요."); return; }
-    await fillProductInfo(url, true);
-  };
+  $("btnInfo").onclick = () => withBusy(async () => {
+    const url0 = firstUrl($inp.value);
+    if(!url0){ setErr("쿠팡 링크를 입력하세요."); return; }
+    await fillProductInfo(normalize(url0), true);
+  });
 
   // 3) 템플릿 복사
   $("btnCopy").onclick = async () => {
@@ -166,7 +186,7 @@
 
       if (!j?.success) throw new Error(j?.error || "product-info 실패");
 
-      // 백엔드 최저가 우선 로직으로 내려온 값 그대로 사용
+      // 백엔드 최저가 우선 로직 결과 그대로 사용
       const title = j.title ?? "";
       const price = j.price != null ? fmt(j.price) : "-";
 
@@ -175,7 +195,12 @@
 
       setTpl();
     }catch(e){
-      setErr(e?.message || String(e));
+      const msg = String(e?.message || e);
+      if (msg.includes("429") || msg.includes("concurrency")) {
+        setErr("요청이 많습니다. 잠시 후 다시 시도해주세요.");
+      } else {
+        setErr(msg);
+      }
     }
   }
 
