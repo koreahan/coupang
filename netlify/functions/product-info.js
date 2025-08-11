@@ -35,30 +35,20 @@ async function normalizeUrl(input){
 }
   
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-  
-async function getFastestHtml(finalUrl) {
-    const ladder = [
-        { render: false, timeout: 8000, premium: false }, // 렌더링 없이 빠른 시도 (가장 빠르고 안정적)
-        { render: true, timeout: 15000, premium: true }, // 실패 시, 프리미엄 프록시로 재시도
-    ];
 
-    let lastErr;
-    for (const step of ladder) {
-        try {
-            const html = await scrapeWithScrapingBee(finalUrl, step);
-            if (/Sorry!\s*Access\s*denied/i.test(html) || html.length < 2000) {
-                throw new Error('BLOCKED_PAGE');
-            }
-            return html;
-        } catch (e) {
-            lastErr = e;
-            const msg = String(e?.message || e);
-            if (msg.includes('HTTP_429')) {
-                console.warn('ScrapingBee 429 에러 발생. 다음 스크래핑 단계로 넘어갑니다.');
-            }
+// 스크래핑 로직 최종 최적화
+async function getFastestHtml(finalUrl) {
+    const step = { render: false, timeout: 8000, premium: false };
+
+    try {
+        const html = await scrapeWithScrapingBee(finalUrl, step);
+        if (/Sorry!\s*Access\s*denied/i.test(html) || html.length < 2000) {
+            throw new Error('BLOCKED_PAGE');
         }
+        return html;
+    } catch (e) {
+        throw new Error(`스크래핑 실패: ${e.message}`);
     }
-    throw lastErr || new Error('All attempts failed');
 }
   
 async function scrapeWithScrapingBee(url, options){
@@ -85,6 +75,7 @@ async function scrapeWithScrapingBee(url, options){
     } finally { clearTimeout(t); }
 }
 
+// 파싱 로직 최종 보강
 function parseInfo(html){
     const prices = [];
     let title = null, currency = "KRW", provider = "none";
@@ -105,7 +96,7 @@ function parseInfo(html){
           const offers = Array.isArray(productData.offers) ? productData.offers : (productData.offers ? [productData.offers] : []);
           offers.forEach(o => {
             if (o.priceCurrency) currency = o.priceCurrency;
-            push(o.price);
+            [o.price, o.lowPrice, o.highPrice].forEach(push);
           });
           provider = "json-ld";
         }
@@ -127,10 +118,11 @@ function parseInfo(html){
     }
   
     const pricePatterns = [
-      /data-rt-price="([\d,.]+)"/gi, /data-price="([\d,.]+)"/gi,
       /class="total-price[^"]*">[\s\S]*?([\d,.]+)\s*원/gi,
       /class="prod-price[^"]*">[\s\S]*?([\d,.]+)\s*원/gi,
       /aria-label="가격\s*([\d,.]+)\s*원"/gi,
+      /data-price="([\d,.]+)"/gi,
+      /data-rt-price="([\d,.]+)"/gi,
     ];
     if (prices.length === 0) {
       const fallbackPrices = new Set();
