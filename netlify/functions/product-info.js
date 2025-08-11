@@ -1,21 +1,23 @@
 // netlify/functions/product-info.js
-// 역할: 쿠팡 원본/짧은 링크 → productId → 모바일 페이지에서 name/price 파싱
-// 변경점: 모바일 UA/ko-KR 헤더, 리다이렉트 허용, 가격/이름 정규식 보강
+// 쿠팡 원본/짧은 링크 → productId → 모바일 상품페이지에서 name/price 파싱
 
 const axios = require("axios");
 
-// 공통 헤더 (모바일 환경 흉내)
+// 모바일 환경 흉내(차단 회피)
 const UA_HEADERS = {
   "User-Agent":
     "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
   "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
 };
 
+// 짧은 링크(link.coupang.com, coupa.ng) → 원본으로 해제
 async function resolveShortIfNeeded(inputUrl, timeoutMs) {
   const isShort = /^https?:\/\/(link\.coupang\.com|coupa\.ng)\//i.test(inputUrl);
   if (!isShort) return inputUrl;
 
   let cur = inputUrl;
+
+  // 1) HEAD로 최대 5회 Location 추적
   for (let i = 0; i < 5; i++) {
     const r = await axios
       .head(cur, {
@@ -25,13 +27,31 @@ async function resolveShortIfNeeded(inputUrl, timeoutMs) {
         timeout: Math.min(1500, timeoutMs),
       })
       .catch((e) => e?.response);
+
     if (!r) break;
     const loc = r.headers?.location;
     if (!loc) break;
+
     cur = new URL(loc, cur).toString();
     if (/^https?:\/\/(www\.)?coupang\.com\//i.test(cur)) return cur;
   }
-  return cur;
+
+  // 2) 일부 케이스는 GET으로만 열려서 한 번 더 시도
+  try {
+    const g = await axios.get(cur, {
+      headers: UA_HEADERS,
+      maxRedirects: 5,
+      timeout: Math.min(3000, timeoutMs),
+      validateStatus: (s) => s >= 200 && s < 400,
+    });
+    // 최종 URL
+    if (g.request && g.request.res && g.request.res.responseUrl) {
+      const final = g.request.res.responseUrl;
+      if (/^https?:\/\/(www\.)?coupang\.com\//i.test(final)) return final;
+    }
+  } catch (_) {}
+
+  return cur; // 실패 시 그대로 반환
 }
 
 function extractProductId(url) {
@@ -49,33 +69,33 @@ async function fetchProductInfo(productId, timeoutMs) {
     validateStatus: (s) => s >= 200 && s < 400,
   });
 
-  const html = resp.data || "";
+  const html = String(resp.data || "");
 
-  // ---------- 이름 추출 ----------
+  // ----- 상품명 -----
   let name = null;
 
-  // 1) og:title
+  // og:title
   const og = html.match(/<meta\s+property=["']og:title["']\s+content=["']([^"']+)["']/i);
   if (og) name = og[1];
 
-  // 2) JSON 키
+  // JSON 키
   if (!name) {
-    const m1 = html.match(/"productName"\s*:\s*"([^"]+)"/i);
-    if (m1) name = m1[1];
+    const j1 = html.match(/"productName"\s*:\s*"([^"]+)"/i);
+    if (j1) name = j1[1];
   }
 
-  // 3) <title>
+  // <title>
   if (!name) {
-    const m2 = html.match(/<title>([^<]+)<\/title>/i);
-    if (m2) name = m2[1];
+    const t1 = html.match(/<title>([^<]+)<\/title>/i);
+    if (t1) name = t1[1];
   }
 
-  // ---------- 가격 추출 ----------
+  // ----- 가격 -----
   const prices = [];
 
-  // JSON 숫자들
+  // JSON 숫자 키들
   const priceJsonRegex =
-    /"(salePrice|discountedPrice|price|unitPrice|originPrice|salePriceDisplay|couponPrice|finalPrice|lowestPrice)"\s*:\s*"?(\d{2,})"?/gi;
+    /"(salePrice|discountedPrice|price|unitPrice|originPrice|finalPrice|lowestPrice|couponPrice)"\s*:\s*"?(\d{2,})"?/gi;
   let mm;
   while ((mm = priceJsonRegex.exec(html)) !== null) {
     const v = parseInt(mm[2], 10);
@@ -86,16 +106,14 @@ async function fetchProductInfo(productId, timeoutMs) {
   const ogPrice = html.match(/property=["']og:price:amount["']\s+content=["'](\d+)["']/i);
   if (ogPrice) prices.push(parseInt(ogPrice[1], 10));
 
-  // 화면 노출 숫자(3자리콤마) 백업 플랜
-  // ex) <strong class="...">12,340</strong>
-  const textPriceRegex = />(\d{1,3}(?:,\d{3})+)\s*원?</g;
-  let t;
-  while ((t = textPriceRegex.exec(html)) !== null) {
-    const v = parseInt(t[1].replace(/,/g, ""), 10);
+  // 화면 노출 숫자 백업 (<strong>12,340</strong>원)
+  const textPriceRegex = />(\d{1,3}(?:,\d{3})+)\s*원?/g;
+  let tp;
+  while ((tp = textPriceRegex.exec(html)) !== null) {
+    const v = parseInt(tp[1].replace(/,/g, ""), 10);
     if (Number.isFinite(v)) prices.push(v);
   }
 
-  // 최솟값(보수적으로)
   const price = prices.length ? Math.min(...prices) : null;
 
   return { name, price, productId, mobileUrl };
@@ -105,15 +123,12 @@ exports.handler = async (event) => {
   if (event.httpMethod !== "POST") {
     return {
       statusCode: 405,
-      body: JSON.stringify({
-        success: false,
-        error: { code: "METHOD_NOT_ALLOWED", message: "POST only" },
-      }),
+      body: JSON.stringify({ success: false, error: { code: "METHOD_NOT_ALLOWED", message: "POST only" } }),
     };
   }
 
+  // Netlify 10초 제한 → 9초 기본, fast=1이면 6초
   const qs = event.queryStringParameters || {};
-  // Netlify 10초 제한 안 넘게 9초(기본) / fast=1 이면 6초
   const timeoutMs = qs.fast === "1" ? 6000 : 9000;
 
   let url = "";
@@ -121,22 +136,12 @@ exports.handler = async (event) => {
     const body = JSON.parse(event.body || "{}");
     url = String(body.url || "").trim();
   } catch {
-    return {
-      statusCode: 400,
-      body: JSON.stringify({
-        success: false,
-        error: { code: "BAD_JSON", message: "Invalid JSON body" },
-      }),
-    };
+    return { statusCode: 400, body: JSON.stringify({ success: false, error: { code: "BAD_JSON", message: "Invalid JSON body" } }) };
   }
-  if (!url)
-    return {
-      statusCode: 400,
-      body: JSON.stringify({
-        success: false,
-        error: { code: "URL_REQUIRED", message: "url required" },
-      }),
-    };
+
+  if (!url) {
+    return { statusCode: 400, body: JSON.stringify({ success: false, error: { code: "URL_REQUIRED", message: "url required" } }) };
+  }
 
   // 1) 짧은 → 원본
   let finalUrl;
@@ -145,11 +150,7 @@ exports.handler = async (event) => {
   } catch (e) {
     return {
       statusCode: 502,
-      body: JSON.stringify({
-        success: false,
-        error: { code: "RESOLVE_FAILED", message: String(e?.message || e) },
-        input: { url },
-      }),
+      body: JSON.stringify({ success: false, error: { code: "RESOLVE_FAILED", message: String(e?.message || e) }, input: { url } }),
     };
   }
 
@@ -158,10 +159,7 @@ exports.handler = async (event) => {
       statusCode: 400,
       body: JSON.stringify({
         success: false,
-        error: {
-          code: "INVALID_URL",
-          message: "쿠팡 상품 원본 URL이 아닙니다.",
-        },
+        error: { code: "INVALID_URL", message: "쿠팡 상품 원본 URL이 아닙니다." },
         input: { url, finalUrl },
       }),
     };
@@ -172,11 +170,7 @@ exports.handler = async (event) => {
   if (!productId) {
     return {
       statusCode: 400,
-      body: JSON.stringify({
-        success: false,
-        error: { code: "NO_PRODUCT_ID", message: "productId 추출 실패" },
-        input: { url, finalUrl },
-      }),
+      body: JSON.stringify({ success: false, error: { code: "NO_PRODUCT_ID", message: "productId 추출 실패" }, input: { url, finalUrl } }),
     };
   }
 
