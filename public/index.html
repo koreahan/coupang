@@ -3,91 +3,142 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>쿠팡 딥링크 · 자동 채움</title>
-  <script src="https://cdn.tailwindcss.com"></script>
+  <title>쿠팡 딥링크 · 점검판</title>
+  <style>
+    body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,Apple SD Gothic Neo,Nanum Gothic,sans-serif;background:#f6f7f9;margin:0}
+    .wrap{max-width:720px;margin:24px auto;padding:0 16px}
+    .card{background:#fff;border:1px solid #e5e7eb;border-radius:16px;padding:16px;box-shadow:0 2px 12px rgba(0,0,0,.05)}
+    h1{font-size:20px;margin:0 0 12px}
+    label{font-size:13px;color:#666;display:block;margin:12px 0 6px}
+    input[type=text]{width:100%;padding:14px;border:1px solid #e5e7eb;border-radius:12px;font-size:16px}
+    .btn{background:#111;color:#fff;border:0;border-radius:12px;padding:10px 14px;font-size:14px;cursor:pointer}
+    .btn.secondary{background:#fff;color:#111;border:1px solid #e5e7eb}
+    .row{display:flex;gap:8px;flex-wrap:wrap}
+    .out{background:#fafafa;border:1px solid #e5e7eb;border-radius:12px;padding:12px;min-height:40px;font-size:14px;word-break:break-all}
+    .error{color:#b00020;background:#fff1f1;border:1px solid #f3c2c2;padding:10px 12px;border-radius:10px;font-size:13px}
+    pre{white-space:pre-wrap;word-break:break-all;background:#f9fafb;border:1px solid #e5e7eb;border-radius:12px;padding:12px;font-size:12px;max-height:320px;overflow:auto}
+    .badge{position:fixed;top:8px;left:8px;background:#111;color:#fff;padding:4px 8px;border-radius:8px;font:12px/1.4 system-ui;z-index:9999}
+  </style>
 </head>
-<body class="bg-neutral-50">
-  <div class="min-h-screen flex flex-col gap-4 items-center p-6">
-    <h1 class="text-2xl font-bold">쿠팡 딥링크 · 자동 채움</h1>
+<body>
+  <div class="badge">BUILD public/index.html · v-check</div>
+  <div class="wrap">
+    <div class="card">
+      <h1>쿠팡 딥링크 · 점검판</h1>
 
-    <div class="w-full max-w-xl bg-white shadow rounded-2xl p-4">
-      <label class="text-sm text-gray-600">문장(첫 번째 http(s)만 인식)</label>
-      <input id="inp" class="mt-2 w-full border rounded-xl p-3" placeholder="예) 쿠팡을 추천합니다! https://link.coupang.com/a/XXXXX" autocomplete="off" autocapitalize="off">
-      <div class="mt-3 flex gap-2">
-        <button id="go" class="px-4 py-2 rounded-xl bg-black text-white">딥링크 생성</button>
+      <label>문장 전체 붙여넣기 OK (첫 번째 http(s)만 인식)</label>
+      <input id="inp" type="text" placeholder="예) 쿠팡을 추천합니다! https://link.coupang.com/a/XXXXX" autocomplete="off" autocapitalize="off" />
+
+      <div class="row" style="margin-top:10px">
+        <button id="btnDeep" class="btn">딥링크 생성</button>
+        <button id="btnInfo" class="btn secondary">상품명/가격 가져오기</button>
+        <button id="btnCopy" class="btn secondary">템플릿 복사</button>
       </div>
 
-      <div id="err" class="mt-3 text-sm text-red-600 hidden"></div>
+      <div id="err" class="error" style="display:none;margin-top:10px"></div>
 
-      <div class="mt-4">
-        <div class="text-sm text-gray-500">파트너스 링크</div>
-        <div id="deeplink" class="mt-1 text-sm break-all border rounded-xl p-3 bg-neutral-50 text-gray-500">(아직 없음)</div>
-      </div>
+      <label style="margin-top:14px">파트너스 링크</label>
+      <div id="deeplink" class="out">(아직 없음)</div>
 
-      <div class="mt-3 grid grid-cols-1 sm:grid-cols-3 gap-3">
-        <div>
-          <div class="text-sm text-gray-500">상품명 (자동)</div>
-          <div id="pname" class="mt-1 border rounded-xl p-3 bg-neutral-50 text-gray-400">딥링크 생성 후 자동 채움</div>
+      <div class="row" style="margin-top:10px">
+        <div style="flex:1;min-width:220px">
+          <label>상품명(자동)</label>
+          <div id="pname" class="out">-</div>
         </div>
-        <div>
-          <div class="text-sm text-gray-500">가격(원, 자동)</div>
-          <div id="pprice" class="mt-1 border rounded-xl p-3 bg-neutral-50 text-gray-400">딥링크 생성 후 자동 채움</div>
-        </div>
-        <div>
-          <div class="text-sm text-gray-500">수량</div>
-          <input id="qty" value="1" class="mt-1 border rounded-xl p-3 bg-white" type="number" min="1">
+        <div style="flex:1;min-width:160px">
+          <label>가격(원, 자동)</label>
+          <div id="pprice" class="out">-</div>
         </div>
       </div>
 
-      <!-- 템플릿 미리보기 + 복사 -->
-      <div class="mt-4">
-        <div class="flex items-center justify-between">
-          <div class="text-sm text-gray-500">템플릿 미리보기</div>
-          <button id="copyTpl" class="px-3 py-2 rounded-lg border text-xs sm:text-sm">전체 복사</button>
-        </div>
-        <pre id="tpl" class="mt-2 bg-neutral-50 border rounded-xl p-3 text-sm whitespace-pre-wrap leading-7"></pre>
-      </div>
+      <label style="margin-top:14px">템플릿 미리보기</label>
+      <pre id="tpl" class="out"></pre>
 
-      <details class="mt-4">
-        <summary class="text-sm text-gray-500 cursor-pointer">API 응답(raw JSON)</summary>
-        <pre id="raw" class="mt-2 bg-neutral-50 border rounded-xl p-3 text-xs break-all">(없음)</pre>
+      <details style="margin-top:14px">
+        <summary>RAW 응답(JSON)</summary>
+        <pre id="raw">(없음)</pre>
       </details>
     </div>
   </div>
 
 <script>
-const ENDPOINT_DEEP = "/.netlify/functions/create-deeplink";
-const ENDPOINT_INFO = "/.netlify/functions/product-info";
+  // === 꼭 확인 ===
+  // Netlify와 같은 도메인에서 열면 빈 문자열("") 유지
+  // 다른 곳(깃허브 등)에서 연다면 "https://<네-넷리파이-도메인>"으로 바꿔쓰기
+  const SITE_ORIGIN = ""; // 예: "https://coupanga.netlify.app"
 
-const $ = (id) => document.getElementById(id);
-const $inp = $("inp"), $go = $("go"), $qty = $("qty"), $copy = $("copyTpl");
-const $err = $("err"), $raw = $("raw"), $tpl = $("tpl");
-const $deeplink = $("deeplink"), $pname = $("pname"), $pprice = $("pprice");
+  const ENDPOINT_DEEP = SITE_ORIGIN + "/.netlify/functions/create-deeplink?debug=1";
+  const ENDPOINT_INFO = SITE_ORIGIN + "/.netlify/functions/product-info?fast=1";
 
-let pname = "", pprice = 0, deeplink = "";
+  const $ = (id) => document.getElementById(id);
+  const $inp = $("inp"), $err = $("err"), $raw = $("raw");
+  const $deeplink = $("deeplink"), $pname = $("pname"), $pprice = $("pprice"), $tpl = $("tpl");
 
-const extractFirstUrl = (s) => {
-  const m = String(s||"").match(/https?:\/\/[^\s]+/);
-  return m ? m[0] : "";
-};
+  const firstUrl = (s)=> (String(s||"").match(/https?:\/\/[^\s]+/)||[])[0] || "";
+  const fmt = (n)=> Number(n||0).toLocaleString("ko-KR")+"원";
 
-function updateTemplate() {
-  const qty = Number($qty.value) || 1;
-  const totalPrice = pprice * qty;
-  const formatted = (n) => n.toLocaleString("ko-KR");
-  $tpl.textContent =
-`【쿠팡】${pname || "상품명"}
-가격: ${pprice ? formatted(pprice) + "원" : "가격정보"}
-수량: ${qty}
-합계: ${totalPrice ? formatted(totalPrice) + "원" : "-"}
-링크: ${deeplink || "쿠팡링크"}
+  function setErr(msg){ if(!msg){$err.style.display="none";$err.textContent="";return;} $err.style.display="block";$err.textContent=msg; }
+  function setTpl(){
+    const name = $pname.textContent && $pname.textContent !== "-" ? $pname.textContent : "상품명";
+    const priceTxt = $pprice.textContent && $pprice.textContent !== "-" ? $pprice.textContent : "가격정보";
+    const link = $deeplink.textContent && !$deeplink.textContent.startsWith("(") ? $deeplink.textContent : "쿠팡링크";
+    $tpl.textContent = `【쿠팡】${name}
+가격: ${priceTxt}
+링크: ${link}
 
 ※ 모든 핫딜은 카드 할인 및 쿠폰 적용가 기준입니다.
 ※ 이 포스팅은 쿠팡파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받습니다. 구입 시 제품 가격에는 아무런 영향이 없습니다.`;
-}
+  }
 
-$qty.addEventListener("input", updateTemplate);
+  async function postJSON(url, body){
+    const res = await fetch(url,{ method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(body) });
+    const text = await res.text();
+    let json; try{ json = JSON.parse(text); }catch{ json = { parseError:true, raw:text }; }
+    return { ok: res.ok, status: res.status, json, text };
+  }
 
-$go.addEventListener("click", async () => {
-  $err.classList.add("hidden");
-  $deeplink.textContent = "(생성 중...)
+  $("btnDeep").onclick = async () => {
+    setErr(""); $raw.textContent = "(딥링크 요청 중...)";
+    const url = firstUrl($inp.value);
+    if(!url){ setErr("쿠팡 링크를 입력하세요."); return; }
+    try{
+      const r = await postJSON(ENDPOINT_DEEP, { url });
+      $raw.textContent = r.text;
+      if(!r.json || r.json.success === false){
+        throw new Error(r.json?.error?.message || r.json?.reason || ("HTTP "+r.status));
+      }
+      const deeplink = r.json.deeplink || r.json.link || "";
+      $deeplink.textContent = deeplink || "(생성 실패)";
+    }catch(e){
+      setErr(e?.message || String(e));
+    }finally{ setTpl(); }
+  };
+
+  $("btnInfo").onclick = async () => {
+    setErr(""); $raw.textContent = "(상품정보 요청 중...)";
+    const url = firstUrl($inp.value);
+    if(!url){ setErr("쿠팡 링크를 입력하세요."); return; }
+    try{
+      const r = await postJSON(ENDPOINT_INFO, { url });
+      $raw.textContent = r.text;
+      if(r.json?.success){
+        if(r.json.info?.name){ $pname.textContent = r.json.info.name; }
+        if(Number.isFinite(r.json.info?.price)){ $pprice.textContent = fmt(r.json.info.price); }
+      }else{
+        throw new Error(r.json?.error?.message || r.json?.reason || ("HTTP "+r.status));
+      }
+    }catch(e){
+      setErr(e?.message || String(e));
+    }finally{ setTpl(); }
+  };
+
+  $("btnCopy").onclick = async () => {
+    await navigator.clipboard.writeText($tpl.textContent || "");
+    alert("복사되었습니다.");
+  };
+
+  // 초기 템플릿 표시
+  setTpl();
+</script>
+</body>
+</html>
