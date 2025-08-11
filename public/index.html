@@ -1,9 +1,82 @@
-<!-- ...상단은 기존 그대로... -->
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>쿠팡 딥링크 · 자동 채움</title>
+  <style>
+    body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,Apple SD Gothic Neo,Nanum Gothic,sans-serif;background:#f6f7f9;margin:0}
+    .wrap{max-width:720px;margin:24px auto;padding:0 16px}
+    .card{background:#fff;border:1px solid #e5e7eb;border-radius:16px;padding:16px;box-shadow:0 2px 12px rgba(0,0,0,.05)}
+    h1{font-size:20px;margin:0 0 12px}
+    label{font-size:13px;color:#666;display:block;margin:12px 0 6px}
+    input[type=text]{width:100%;padding:14px;border:1px solid #e5e7eb;border-radius:12px;font-size:16px}
+    .btn{background:#111;color:#fff;border:0;border-radius:12px;padding:10px 14px;font-size:14px;cursor:pointer}
+    .btn[disabled]{opacity:.5;cursor:not-allowed}
+    .btn.secondary{background:#fff;color:#111;border:1px solid #e5e7eb}
+    .btn.small{padding:6px 10px;font-size:12px;border-radius:10px}
+    .row{display:flex;gap:8px;flex-wrap:wrap}
+    .row-between{display:flex;align-items:center;justify-content:space-between;gap:8px}
+    .out{background:#fafafa;border:1px solid #e5e7eb;border-radius:12px;padding:12px;min-height:40px;font-size:14px;word-break:break-all}
+    .error{color:#b00020;background:#fff1f1;border:1px solid #f3c2c2;padding:10px 12px;border-radius:10px;font-size:13px}
+    pre{white-space:pre-wrap;word-break:break-all;background:#f9fafb;border:1px solid #e5e7eb;border-radius:12px;padding:12px;font-size:12px;max-height:320px;overflow:auto}
+    .badge{position:fixed;top:8px;left:8px;background:#111;color:#fff;padding:4px 8px;border-radius:8px;font:12px/1.4 system-ui;z-index:9999}
+    .muted{color:#666;font-size:12px}
+  </style>
+</head>
+<body>
+  <div class="badge">BUILD public/index.html</div>
+  <div class="wrap">
+    <div class="card">
+      <h1>쿠팡 딥링크 · 자동 채움</h1>
+
+      <label>문장 전체 붙여넣기 OK (첫 번째 http(s)만 인식)</label>
+      <input id="inp" type="text" placeholder="예) 쿠팡을 추천합니다! https://link.coupang.com/a/XXXXX" autocomplete="off" autocapitalize="off" />
+
+      <div class="row" style="margin-top:10px">
+        <button id="btnGo" class="btn">딥링크 생성</button>
+        <button id="btnInfo" class="btn secondary">상품정보 채우기</button>
+        <button id="btnCopy" class="btn secondary">템플릿 복사</button>
+      </div>
+
+      <div id="err" class="error" style="display:none;margin-top:10px"></div>
+
+      <div class="row-between" style="margin-top:14px">
+        <label style="margin:0">파트너스 링크</label>
+        <button id="btnCopyLink" class="btn secondary small" disabled>링크 복사</button>
+      </div>
+      <div id="deeplink" class="out">(아직 없음)</div>
+      <div class="muted">* 링크가 생성되면 ‘링크 복사’ 버튼이 활성화됩니다.</div>
+
+      <div class="row" style="margin-top:10px">
+        <div style="flex:1;min-width:220px">
+          <label>상품명(자동)</label>
+          <div id="pname" class="out">-</div>
+        </div>
+        <div style="flex:1;min-width:160px">
+          <label>가격(원, 자동)</label>
+          <div id="pprice" class="out">-</div>
+        </div>
+      </div>
+
+      <label style="margin-top:14px">템플릿 미리보기</label>
+      <pre id="tpl" class="out"></pre>
+
+      <details style="margin-top:14px">
+        <summary>RAW 응답(JSON)</summary>
+        <pre id="raw">(없음)</pre>
+      </details>
+    </div>
+  </div>
+
 <script>
-  const SITE_ORIGIN = ""; // 같은 도메인이면 "" 유지
+document.addEventListener('DOMContentLoaded', () => {
+  // ====== 설정 ======
+  const SITE_ORIGIN = ""; // 같은 도메인이면 "" 유지 (예: "https://xxxx.netlify.app"로 바꿔도 됨)
   const ENDPOINT_DEEP = SITE_ORIGIN + "/.netlify/functions/create-deeplink";
   const ENDPOINT_INFO = SITE_ORIGIN + "/.netlify/functions/product-info";
 
+  // ====== helpers ======
   const $ = id => document.getElementById(id);
   const $inp = $("inp"), $err = $("err"), $raw = $("raw");
   const $deeplink = $("deeplink"), $pname = $("pname"), $pprice = $("pprice"), $tpl = $("tpl");
@@ -33,8 +106,6 @@
     const valid = link && !link.startsWith("(");
     $btnCopyLink.disabled = !valid;
   };
-
-  // URL 정규화(프런트 보조)
   const normalize = u => {
     const m = String(u||"").match(/\/products\/(\d{6,})/);
     return m ? `https://www.coupang.com/vp/products/${m[1]}` : u;
@@ -45,10 +116,12 @@
   const withBusy = async (fn) => {
     if (_busy) return;
     _busy = true; $btnGo.disabled = true; $btnInfo.disabled = true;
-    try { await fn(); } finally { _busy = false; $btnGo.disabled = false; $btnInfo.disabled = false; }
+    try { await fn(); }
+    finally { _busy = false; $btnGo.disabled = false; $btnInfo.disabled = false; }
   };
 
-  // 딥링크 생성
+  // ====== 이벤트 ======
+  // 1) 딥링크 생성 → 성공 후 자동으로 상품정보 채우기
   $btnGo.onclick = () => withBusy(async () => {
     setErr(""); $raw.textContent="(요청 중...)";
     $deeplink.textContent="(생성 중...)"; $pname.textContent="-"; $pprice.textContent="-"; updateCopyLinkButton(); setTpl();
@@ -70,19 +143,20 @@
     finally{ setTpl(); }
   });
 
-  // 상품정보 채우기(수동)
+  // 2) 상품정보 채우기 (수동 버튼)
   $btnInfo.onclick = () => withBusy(async () => {
     const url0 = firstUrl($inp.value);
     if(!url0){ setErr("쿠팡 링크를 입력하세요."); return; }
     await fillProductInfo(normalize(url0), true);
   });
 
-  // 템플릿 복사
+  // 3) 템플릿 복사
   $("btnCopy").onclick = async () => {
     await navigator.clipboard.writeText($tpl.textContent || "");
     alert("복사되었습니다.");
   };
-  // 링크 복사
+
+  // 4) 링크 복사
   $btnCopyLink.onclick = async () => {
     const link = $deeplink.textContent?.trim();
     if (!link || link.startsWith("(")) return;
@@ -90,18 +164,23 @@
     const prev = $btnCopyLink.textContent; $btnCopyLink.textContent = "복사됨!"; setTimeout(()=>{ $btnCopyLink.textContent = prev; }, 1200);
   };
 
-  // 백엔드 결과로 화면 채우기
+  // ====== 핵심: product-info 호출해 화면 반영 ======
   async function fillProductInfo(url, appendRaw){
     try{
-      const r = await fetch(ENDPOINT_INFO, { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify({ url }) });
+      const r = await fetch(ENDPOINT_INFO, {
+        method:"POST", headers:{ "Content-Type":"application/json" },
+        body: JSON.stringify({ url })
+      });
       const txt = await r.text(); let j; try{ j=JSON.parse(txt);}catch{ j=null; }
       if (appendRaw) $raw.textContent += "\n\n--- product-info ---\n" + (txt || "(empty)");
+
       if (!j?.success) throw new Error(j?.error || "product-info 실패");
 
       const title = j.title ?? "";
-      const price = Number.isFinite(j.price) ? fmt(j.price) : "-"; // ← 정수 price를 원화로 표시
+      const price = Number.isFinite(j.price) ? fmt(j.price) : "-"; // ← 백엔드의 '최저가(정수)'를 원화 표기로
       if (title) $pname.textContent = title;
       if (price) $pprice.textContent = price;
+
       setTpl();
     }catch(e){
       const msg = String(e?.message || e);
@@ -110,12 +189,17 @@
     }
   }
 
-  // 콘솔/북마클릿에서 바로 채우기용 공개 함수
+  // 콘솔/북마클릿에서 즉시 채우기용 공개 함수
   window.fillFromApi = async (input) => {
     const url = normalize((String(input||"").match(/https?:\/\/[^\s]+/)||[])[0] || input);
     $inp.value = url;
     await fillProductInfo(url, true);
   };
 
-  setTpl(); updateCopyLinkButton();
+  // 초기 렌더
+  setTpl();
+  updateCopyLinkButton();
+});
 </script>
+</body>
+</html>
