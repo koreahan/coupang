@@ -1,104 +1,190 @@
-// Netlify Function — FAST+ (<=6s 목표, 짧은 렌더 보조)
-const API = "https://app.scrapingbee.com/api/v1/";
-const { SCRAPINGBEE_KEY, SCRAPINGBEE_PREMIUM } = process.env;
-
+// Netlify Function v1 (Node 18+)
+// 쿠팡 상품명/최저가 추출 API (정규화 + 빠른/안정 스크랩 + 최저가 보장)
 const CORS = {
-  "Access-Control-Allow-Origin":"*",
-  "Access-Control-Allow-Methods":"POST, OPTIONS",
-  "Access-Control-Allow-Headers":"Content-Type",
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
 };
 
 exports.handler = async (event) => {
-  try{
-    if (event.httpMethod === "OPTIONS") return { statusCode:200, headers:CORS, body:"" };
-    if (event.httpMethod !== "POST") return { statusCode:405, headers:CORS, body:"POST only" };
-    if (!SCRAPINGBEE_KEY) return resp(500, { success:false, error:"Missing SCRAPINGBEE_KEY" });
-
-    const { url:raw } = JSON.parse(event.body||"{}");
-    if (!raw) return resp(400, { success:false, error:"url required" });
-
-    const url = normalize(raw);
-
-    // 1) 정적(빠름)
-    let html = await getBee(url, { render_js:false, timeout:2500, block_resources:true }).catch(()=> "");
-    let parsed = parse(html);
-    if (parsed.title && (parsed.price || parsed.price === null)) {
-      return resp(200, ok(raw, url, parsed, "fast-static"));
+  try {
+    if (event.httpMethod === "OPTIONS") {
+      return { statusCode: 200, headers: CORS, body: "" };
+    }
+    if (event.httpMethod !== "POST") {
+      return { statusCode: 405, headers: CORS, body: "POST only" };
     }
 
-    // 2) 짧은 렌더(제목 우선) — 3s, 프리미엄 있으면 사용
-    html = await getBee(url, { render_js:true, timeout:3000, premium_proxy: !!SCRAPINGBEE_PREMIUM, block_resources:true }).catch(()=> "");
-    parsed = mergePrefTitle(parsed, parse(html)); // 기존 결과에 제목만 보강
-    return resp(200, ok(raw, url, parsed, "fast+render"));
-  }catch(e){
-    return resp(200, { success:false, error:String(e?.message||e) });
+    const { url } = JSON.parse(event.body || "{}");
+    if (!url) return json({ success: false, error: "No URL provided" });
+
+    const finalUrl = await normalizeUrl(url);
+    const html = await getFastestHtml(finalUrl);
+    const parsed = parseInfo(html) || {};
+
+    return json({
+      success: true,
+      finalUrl,
+      title: parsed.title ?? null,
+      price: parsed.price ?? null,           // ← 항상 "최저가(정수, 원)" 반환
+      currency: parsed.currency ?? "KRW",
+      provider: parsed.provider ?? "coupang",
+    });
+  } catch (err) {
+    return json({ success: false, error: String((err && err.message) || err) });
   }
 };
 
-function resp(code, body){ return { statusCode:code, headers:CORS, body:JSON.stringify(body) }; }
-function ok(inputUrl, finalUrl, {title, price}, mode){
-  return { success:true, inputUrl, finalUrl, title: title||null, price: Number.isFinite(price)?price:null, currency:"KRW", provider:"coupang", mode };
+function json(obj, code = 200) {
+  return {
+    statusCode: code,
+    headers: { "Content-Type": "application/json", ...CORS },
+    body: JSON.stringify(obj),
+  };
 }
-function normalize(u){ const m=String(u).match(/\/products\/(\d{6,})/); return m ? `https://www.coupang.com/vp/products/${m[1]}` : u; }
 
-// ScrapingBee 호출(필요한 필드만)
-async function getBee(url, opt){
-  const qs = new URLSearchParams({
-    api_key: SCRAPINGBEE_KEY,
+// ---------- URL 정규화 ----------
+// 짧은링크 해제 → 쿼리 제거 → /vp/products/{id} 형태로 통일
+async function normalizeUrl(input) {
+  let u = String(input || "").trim();
+
+  // link.coupang.com 딥링크면 실제 상품 주소로 1회 해제
+  if (u.includes("link.coupang.com")) {
+    const r = await fetch(u, { method: "HEAD", redirect: "manual" });
+    const loc = r.headers.get("location");
+    if (loc) u = loc;
+  }
+
+  const url = new URL(u);
+  [
+    "redirect","src","addtag","itime","lptag","wTime","wPcid","wRef","traceid",
+    "pageType","pageValue","spec","ctag","mcid","placementid","clickBeacon",
+    "campaignid","puidType","contentcategory","imgsize","pageid","tsource",
+    "deviceid","token","contenttype","subid","sig","impressionid","campaigntype",
+    "puid","requestid","ctime","contentkeyword","portal","landing_exp","subparam"
+  ].forEach(p => url.searchParams.delete(p));
+
+  const m = url.pathname.match(/\/(vp\/)?products\/(\d{6,})/);
+  return m ? `https://www.coupang.com/vp/products/${m[2]}` : url.toString();
+}
+
+// ---------- 스크랩 (빠른/안정) ----------
+async function getFastestHtml(finalUrl) {
+  const attempts = [
+    // 빠른 렌더(모바일) – 6.5s
+    () => scrapeWithScrapingBee(finalUrl, 6500, mobileHeaders(), true),
+    // 빠른 렌더(데스크톱) – 6.5s
+    () => scrapeWithScrapingBee(finalUrl, 6500, desktopHeaders(), true),
+    // 비렌더(데스크톱) – 2.5s (메타/JSON-LD만으로도 되는 케이스)
+    () => scrapeWithScrapingBee(finalUrl, 2500, desktopHeaders(), false),
+  ];
+
+  const settled = await Promise.allSettled(attempts.map(fn => fn()));
+  const ok = settled.find(r => r.status === "fulfilled");
+  if (ok) return ok.value;
+
+  const reasons = settled
+    .map(r => (r.status === "rejected" ? String(r.reason) : ""))
+    .filter(Boolean);
+  throw new Error("All attempts failed: " + reasons.join(" | "));
+}
+
+function desktopHeaders() {
+  return {
+    "User-Agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+  };
+}
+function mobileHeaders() {
+  return {
+    "User-Agent":
+      "Mozilla/5.0 (Linux; Android 13; SM-S908N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+  };
+}
+
+async function scrapeWithScrapingBee(url, timeoutMs, headers, render = true) {
+  const apiKey = process.env.SCRAPINGBEE_KEY;
+  if (!apiKey) throw new Error("Missing SCRAPINGBEE_KEY");
+
+  const params = {
+    api_key: apiKey,
     url,
-    render_js: opt.render_js ? "true" : "false",
-    block_resources: opt.block_resources ? "true" : "false",
+    render_js: render ? "true" : "false",
+    ...(process.env.SCRAPINGBEE_PREMIUM === "1" ? { premium_proxy: "true" } : {}),
     country_code: "kr",
-    timeout: String(opt.timeout || 3000),
-    ...(opt.premium_proxy ? { premium_proxy: "true" } : {})
-  }).toString();
-  const r = await fetch(API + "?" + qs);
-  const t = await r.text();
-  if (!r.ok) throw new Error(`Bee ${r.status} ${t}`);
-  return t;
+    ...(render
+      ? { wait_for: 'meta[property="og:title"],script[type="application/ld+json"]' }
+      : {}),
+    forward_headers: "true", // 요청의 헤더를 대상 사이트로 전달
+  };
+  const qs = new URLSearchParams(params);
+
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  const res = await fetch(`https://app.scrapingbee.com/api/v1?${qs}`, {
+    method: "GET",
+    headers,
+    signal: ctrl.signal,
+  }).finally(() => clearTimeout(t));
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`ScrapingBee ${res.status} ${body}`);
+  }
+  return res.text();
 }
 
-// 제목/가격 파싱(강화)
-function parse(html){
-  const title =
-    rx1(html, /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)/i) ||
-    rx1(html, /<meta[^>]+name=["']twitter:title["'][^>]+content=["']([^"']+)/i) ||
-    rx1(html, /<meta[^>]+name=["']title["'][^>]+content=["']([^"']+)/i) ||
-    rx1(html, /id=["']productTitle["'][^>]*>([^<]+)/i) ||
-    rx1Json(html, /<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi, o=>o?.name) || null;
+// ---------- 파서 (최저가 보장) ----------
+function toNum(x){ if(x==null) return null; const n = +String(x).replace(/[^\d]/g,""); return Number.isFinite(n) ? n : null; }
+function uniqNums(arr){ const s=new Set(), out=[]; for(const n of arr){ if(n==null) continue; if(!s.has(n)){ s.add(n); out.push(n);} } return out; }
 
-  const nums = uniqNums(
-    []
-      .concat(rxAllNums(html, /<meta[^>]+property=["']product:price:amount["'][^>]+content=["']?(\d[\d,.]*)/gi))
-      .concat(rxAllNums(html, /"finalPrice"\s*:\s*"?(\d[\d,]*)"?/gi))
-      .concat(rxAllNums(html, /"discountPrice"\s*:\s*"?(\d[\d,]*)"?/gi))
-      .concat(rxAllNums(html, /"salePrice"\s*:\s*"?(\d[\d,]*)"?/gi))
-      .concat(rxAllNums(html, /"wowPrice"\s*:\s*"?(\d[\d,]*)"?/gi))
-      .concat(rxAllNums(html, /"rocketCardPrice"\s*:\s*"?(\d[\d,]*)"?/gi))
-      .concat(rxAllNums(html, /"couponPrice"\s*:\s*"?(\d[\d,]*)"?/gi))
-      .concat(rxAllNums(html, /"lowestPrice"\s*:\s*"?(\d[\d,]*)"?/gi))
-      .concat(rxAllNums(html, /"price"\s*:\s*"?(\d[\d,]*)"?/gi))
-      .concat(rxAllJson(html, /<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi, (obj)=>{
-        const arr=[]; const offer=obj?.offers||obj?.aggregateOffer||obj?.offers?.[0];
-        if (offer?.price) arr.push(toNum(offer.price));
-        if (offer?.lowPrice) arr.push(toNum(offer.lowPrice));
-        return arr.filter(Boolean);
-      }))
-  ).filter(n=>n>0);
-  const price = nums.length ? Math.min(...nums) : null;
+function parseInfo(html) {
+  // JSON-LD 블록(배열/@graph 포함) 수집
+  const ldBlocks = [...html.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)]
+    .map(m => { try { return JSON.parse(m[1]); } catch { return null; } })
+    .filter(Boolean)
+    .flatMap(o => Array.isArray(o) ? o : (o['@graph'] ? o['@graph'] : [o]));
 
-  return { title, price };
+  let title = null;
+  const prices = [];
+
+  // 1) JSON-LD Product
+  for (const o of ldBlocks) {
+    if (o && (o['@type'] === 'Product' || o.name)) {
+      if (!title && o.name) title = String(o.name).trim();
+      const offers = Array.isArray(o.offers) ? o.offers[0] : o.offers;
+      if (offers) {
+        if (offers.price) prices.push(toNum(offers.price));
+        if (offers.lowPrice) prices.push(toNum(offers.lowPrice));
+      }
+    }
+  }
+
+  // 2) 메타/타이틀 보강
+  if (!title) {
+    title =
+      (html.match(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)/i)?.[1]) ||
+      (html.match(/<meta[^>]+name=["']title["'][^>]+content=["']([^"']+)/i)?.[1]) ||
+      (html.match(/<title>([^<]+)<\/title>/i)?.[1]) || null;
+    if (title) title = title.replace(/\s*-\s*쿠팡.*$/,'').trim();
+  }
+
+  // 3) 페이지 내 JSON/속성에서 가격 후보 더 긁기 (최저가 선택)
+  const addNums = (re) => { let m; while ((m = re.exec(html))) prices.push(toNum(m[1])); };
+  addNums(/"finalPrice"\s*:\s*"?([\d,\.]+)"?/gi);
+  addNums(/"discountPrice"\s*:\s*"?([\d,\.]+)"?/gi);
+  addNums(/"salePrice"\s*:\s*"?([\d,\.]+)"?/gi);
+  addNums(/"wowPrice"\s*:\s*"?([\d,\.]+)"?/gi);
+  addNums(/"rocketCardPrice"\s*:\s*"?([\d,\.]+)"?/gi);
+  addNums(/"couponPrice"\s*:\s*"?([\d,\.]+)"?/gi);
+  addNums(/"lowestPrice"\s*:\s*"?([\d,\.]+)"?/gi);
+  addNums(/"price"\s*:\s*"?([\d,\.]+)"?/gi);
+  addNums(/data-price="([\d\.]+)"/gi);
+
+  const cand = uniqNums(prices).filter(n => Number.isFinite(n) && n>0);
+  const price = cand.length ? Math.min(...cand) : null;
+
+  return { title: title || null, price, currency: 'KRW', provider: 'coupang' };
 }
-
-function mergePrefTitle(a,b){ return { title: b.title || a.title || null, price: a.price ?? b.price ?? null }; }
-
-// helpers
-function rx1(s,re){ const m=re.exec(s||""); return m ? sanitize(m[1]) : null; }
-function rxAllNums(s,re){ const out=[]; let m; while((m=re.exec(s||""))){ const n=toNum(m[1]); if(n) out.push(n);} return out; }
-function rx1Json(s,re,picker){ let m; while((m=re.exec(s||""))){ try{ const o=JSON.parse(m[1]); const v=picker(o); if(v) return sanitize(v);}catch{}} return null; }
-function rxAllJson(s,re,picker){ const out=[]; let m; while((m=re.exec(s||""))){ try{ const o=JSON.parse(m[1]); const v=picker(o); if(Array.isArray(v)) out.push(...v); else if(v) out.push(v);}catch{}} return out; }
-function toNum(x){ if(x==null) return null; const n=Number(String(x).replace(/[^\d.]/g,"")); return Number.isFinite(n)?Math.round(n):null; }
-function uniqNums(a){ const s=new Set(),o=[]; for(const n of a){ if(n==null) continue; if(!s.has(n)){ s.add(n); o.push(n);} } return o; }
-function sanitize(t){ return String(t||"").replace(/\s+/g," ").trim(); }
-
-
