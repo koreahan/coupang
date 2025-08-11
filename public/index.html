@@ -95,11 +95,23 @@ function setErr(msg){ if(!msg){$("err").style.display="none";} else {$("err").st
 
 function refreshTpl(){
   let name = $("pname").textContent !== "-" ? $("pname").textContent : "상품명";
-  // ' - ' 이후의 모든 텍스트를 제거하는 로직으로 수정
+  // ' - ' 또는 ' | ' 이후의 모든 텍스트를 제거하는 새로운 로직
   const hyphenIndex = name.indexOf(' - ');
-  if (hyphenIndex !== -1) {
-    name = name.substring(0, hyphenIndex).trim();
+  const pipeIndex = name.indexOf(' | ');
+  let cutIndex = -1;
+
+  if (hyphenIndex !== -1 && pipeIndex !== -1) {
+    cutIndex = Math.min(hyphenIndex, pipeIndex);
+  } else if (hyphenIndex !== -1) {
+    cutIndex = hyphenIndex;
+  } else if (pipeIndex !== -1) {
+    cutIndex = pipeIndex;
   }
+  
+  if (cutIndex !== -1) {
+    name = name.substring(0, cutIndex).trim();
+  }
+  
   const price = $("pprice").textContent !== "-" ? $("pprice").textContent : "가격정보";
   const link = $("deeplink").textContent && !$("deeplink").textContent.startsWith("(")? $("deeplink").textContent : "쿠팡링크";
   $("tpl").textContent = `【쿠팡】${name}
