@@ -1,7 +1,5 @@
-// netlify/functions/product-info.js
 // Netlify Function v1 (Node 18+)
-// 쿠팡 상품명/최저가 추출 — 8초 예산, 순차 시도(비렌더→비렌더→렌더→직접), NUXT/NEXT 지원
-
+// 쿠팡 상품명/최저가 추출 API
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
@@ -16,15 +14,11 @@ exports.handler = async (event) => {
     const { url } = JSON.parse(event.body || "{}");
     if (!url) return json({ success:false, error:"No URL provided" }, 400);
 
-    // === 8s budget (Netlify 10s 아래) ===
-    const T0 = Date.now(), BUDGET = 8000;
-    const left = () => Math.max(0, BUDGET - (Date.now() - T0));
-
-    const finalUrl = await normalizeUrl(url);
-    const html = await getHtml(finalUrl, left); // 예산 내에서 순차 시도
+    const finalUrl = await normalizeUrl(url);     // ✅ 짧은링크 해체 + itemId 보존
+    const html = await getFastestHtml(finalUrl);  // ✅ 렌더 대기 강화
 
     const parsed = parseInfo(html) || { title:null, prices:[], currency:"KRW", provider:"none" };
-    const fallback = pickPriceFallback(html);
+    const fallback = pickPriceFallback(html);     // 모든 후보 수집(Set → array)
 
     const all = [...(parsed.prices||[]), ...fallback].filter(n => Number.isFinite(n) && n > 0);
     const minPrice = all.length ? Math.min(...all) : null;
@@ -33,13 +27,13 @@ exports.handler = async (event) => {
       success: true,
       finalUrl,
       title: parsed.title ?? null,
-      price: minPrice ?? null,      // 숫자(KRW)
+      price: minPrice != null ? String(minPrice) : null,  // ✅ 최저가
       currency: parsed.currency ?? "KRW",
-      provider: parsed.provider ?? null
+      provider: parsed.provider ?? null,
+      debug: { count: all.length, sample: all.slice(0, 20) }
     });
   } catch (e) {
-    const msg = String(e && e.message || e);
-    return json({ success:false, error: msg.includes("aborted") ? "timeout" : msg }, 504);
+    return json({ success:false, error:String(e?.message || e) }, 500);
   }
 };
 
@@ -47,12 +41,17 @@ function json(obj, code=200){
   return { statusCode: code, headers: { "Content-Type":"application/json", ...CORS }, body: JSON.stringify(obj) };
 }
 
-// ---------- URL 정규화 (짧은링크 해제 + 추적 제거 + itemId/vendorItemId 보존) ----------
+// ---------- URL 정규화(짧은링크 해체 + 추적 제거 + itemId/vendorItemId 보존) ----------
 async function normalizeUrl(input){
-  let u = String(input||"").trim();
+  let u = String(input || "").trim();
+
+  // ✅ 짧은링크 해체
   if (u.includes("link.coupang.com")) {
-    try { const r = await fetch(u, { method:"HEAD", redirect:"manual" }); const loc = r.headers.get("location"); if (loc) u = loc; } catch {}
+    const r = await fetch(u, { method: "HEAD", redirect: "manual" });
+    const loc = r.headers.get("location");
+    if (loc) u = loc;
   }
+
   const url = new URL(u);
   const itemId = url.searchParams.get("itemId");
   const vendorItemId = url.searchParams.get("vendorItemId");
@@ -74,8 +73,21 @@ async function normalizeUrl(input){
   return out.toString();
 }
 
-// ---------- HTML 가져오기 (비렌더→비렌더→렌더→직접) ----------
-const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
+// ---------- 스크래핑 ----------
+async function getFastestHtml(finalUrl){
+  const attempts = [
+    () => scrapeWithScrapingBee(finalUrl, 14000, desktopHeaders(), true),
+    () => scrapeWithScrapingBee(finalUrl, 14000, mobileHeaders(),  true),
+    () => scrapeWithScrapingBee(finalUrl, 7000,  desktopHeaders(), false),
+  ];
+  try { return await Promise.any(attempts.map(fn => fn())); }
+  catch {
+    const settled = await Promise.allSettled(attempts.map(fn => fn()));
+    const reasons = settled.map(r => r.status === "rejected" ? String(r.reason) : "").filter(Boolean);
+    throw new Error("All attempts failed: " + reasons.join(" | "));
+  }
+}
+
 function desktopHeaders(){ return {
   "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
   "Accept-Language":"ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7"
@@ -85,126 +97,92 @@ function mobileHeaders(){ return {
   "Accept-Language":"ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7"
 };}
 
-async function getHtml(finalUrl, left){
-  const steps = [
-    { fn:()=>bee(finalUrl, Math.min(1200, Math.max(600, left()-200)), desktopHeaders(), false) },
-    { fn:()=>bee(finalUrl, Math.min(1200, Math.max(600, left()-200)), mobileHeaders(),  false) },
-    { fn:()=>bee(finalUrl, Math.min(2000, Math.max(600, left()-200)), desktopHeaders(), true ) },
-    { fn:()=>direct(finalUrl, Math.min(1200, Math.max(600, left()-200)), desktopHeaders())    }, // 최후의 보루
-  ];
-  let last;
-  for (const s of steps){
-    if (left() < 500) break;
-    try { return await s.fn(); } catch(e){ last = e; }
-  }
-  throw last || new Error("aborted: budget");
-}
-
-async function bee(url, timeoutMs, headers, render=true){
+async function scrapeWithScrapingBee(url, timeoutMs, headers, render=true){
   const apiKey = process.env.SCRAPINGBEE_KEY;
   if (!apiKey) throw new Error("Missing SCRAPINGBEE_KEY");
+
   const params = {
     api_key: apiKey,
     url,
     render_js: render ? "true" : "false",
     country_code: "kr",
-    ...(render ? {
-      wait_for: 'meta[property="og:title"], script[type="application/ld+json"], script[id="__NEXT_DATA__"], #__nuxt, #__next, .prod-buy-header__title'
-    } : {}),
+    ...(render ? { wait:"2500", wait_for:'meta[property="og:title"], script[type="application/ld+json"]' } : {}),
     ...(process.env.SCRAPINGBEE_PREMIUM === "1" ? { premium_proxy:"true" } : {}),
-    // forward_headers 비활성 권장
+    forward_headers: "true",
   };
   const qs = new URLSearchParams(params);
 
   const ctrl = new AbortController();
-  const t = setTimeout(()=>ctrl.abort(), timeoutMs);
-  try{
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
     const res = await fetch(`https://app.scrapingbee.com/api/v1?${qs}`, { method:"GET", headers, signal: ctrl.signal });
-    if (!res.ok){
+    if (!res.ok) {
       const body = await res.text().catch(()=> "");
-      // 429/5xx 한 번만 짧게 재시도
-      const code = Number((/^\D*(\d{3})/.exec(body)||[])[1]||res.status);
-      if (code===429 || (code>=500 && code<600)) {
-        clearTimeout(t); await sleep(250);
-        return await bee(url, timeoutMs, headers, render);
-      }
-      throw new Error(`ScrapingBee ${res.status} ${body.slice(0,180)}`);
+      throw new Error(`ScrapingBee ${res.status} ${body.slice(0,300)}`);
     }
-    return await res.text();
+    return res.text();
   } finally { clearTimeout(t); }
 }
 
-// Bee 실패 시 직접 가져오기(서버사이드라 CORS 무관)
-async function direct(url, timeoutMs, headers){
-  const ctrl = new AbortController();
-  const t = setTimeout(()=>ctrl.abort(), timeoutMs);
-  try{
-    const res = await fetch(url, { headers, signal: ctrl.signal });
-    if (!res.ok) throw new Error("direct "+res.status);
-    return await res.text();
-  } finally { clearTimeout(t); }
-}
-
-// ---------- 파싱 (JSON-LD / NUXT / NEXT.js / META / 텍스트) ----------
+// ---------- 파싱(옵션 20개까지 가격 싹 긁기) ----------
 function parseInfo(html){
   const prices = [];
   let title = null, currency = "KRW", provider = "none";
-  const toNum = v => { const s=String(v??"").replace(/[^0-9.]/g,""); const n=s?Number(s):NaN; return Number.isFinite(n)&&n>0?Math.round(n):null; };
+
+  const toNum = v => {
+    const s = String(v ?? "").replace(/[^0-9.]/g, "");
+    const n = s ? Number(s) : NaN;
+    return Number.isFinite(n) && n > 0 ? n : null;
+  };
   const push = v => { const n = toNum(v); if (n) prices.push(n); };
   const pullAll = (src, re) => { for (const m of src.matchAll(re)) push(m[1]); };
 
   // JSON-LD
   const ldBlocks = [...html.matchAll(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/gi)]
-    .map(m=>{try{return JSON.parse(m[1]);}catch{return null;}})
+    .map(m => { try { return JSON.parse(m[1]); } catch { return null; } })
     .filter(Boolean)
-    .flatMap(o=>Array.isArray(o)?o:(o['@graph']?o['@graph']:[o]));
-  const prods = ldBlocks.filter(o=>o&&(o['@type']==='Product'||o['@type']?.includes?.('Product')||o.name));
+    .flatMap(o => Array.isArray(o) ? o : (o['@graph'] ? o['@graph'] : [o]));
+
+  const prods = ldBlocks.filter(o => o && (o['@type']==='Product' || o['@type']?.includes?.('Product') || o.name));
   if (prods.length){
-    provider="json-ld";
-    const p0 = prods.find(p=>p?.name); if (p0?.name) title=p0.name;
+    provider = "json-ld";
+    const p0 = prods.find(p => p?.name);
+    if (p0?.name) title = p0.name;
     for (const p of prods){
-      const offers = Array.isArray(p.offers)?p.offers:(p.offers?[p.offers]:[]);
+      const offers = Array.isArray(p.offers) ? p.offers : (p.offers ? [p.offers] : []);
       for (const ofr of offers){
         if (ofr?.priceCurrency) currency = ofr.priceCurrency;
         [ofr?.price, ofr?.lowPrice, ofr?.highPrice].forEach(push);
         const ps = ofr?.priceSpecification;
-        (Array.isArray(ps)?ps:(ps?[ps]:[])).forEach(s=>[s?.price,s?.minPrice,s?.maxPrice].forEach(push));
+        (Array.isArray(ps) ? ps : ps ? [ps] : []).forEach(s => [s?.price, s?.minPrice, s?.maxPrice].forEach(push));
       }
     }
   }
 
-  // META / TITLE
+  // og / <title>
   const og = html.match(/<meta property="og:title" content="([^"]+)"/i) || html.match(/<meta name="title" content="([^"]+)"/i);
-  if (!title && og?.[1]) { title = og[1]; provider = provider==="none"?"meta":provider; }
-  if (!title){ const t = html.match(/<title>([^<]+)<\/title>/i); if (t?.[1]){ title=t[1].trim(); provider = provider==="none"?"title":provider; } }
+  if (!title && og?.[1]) { title = og[1]; provider = provider === "none" ? "meta" : provider; }
+  if (!title){
+    const t = html.match(/<title>([^<]+)<\/title>/i);
+    if (t?.[1]) { title = t[1].trim(); provider = provider === "none" ? "title" : provider; }
+  }
 
-  // __NUXT__
+  // __NUXT__ 전체 스캔 (옵션/버전 배열 포함)
   const nuxt = html.match(/window\.__NUXT__\s*=\s*(\{[\s\S]*?\});/);
   if (nuxt){
     try{
       const s = JSON.stringify(JSON.parse(nuxt[1]));
       if (!title) title = s.match(/"productName"\s*:\s*"([^"]+)"/)?.[1] || s.match(/"name"\s*:\s*"([^"]+)"/)?.[1] || title;
-      ["couponPrice","finalPrice","discountedPrice","salePrice","lowPrice","price","totalPrice","optionPrice","dealPrice","memberPrice","cardPrice","instantDiscountPrice"]
-        .forEach(k=>pullAll(s, new RegExp('"' + k + '"\\s*:\\s*("?[-\\d\\.,]+"?)','gi')));
-      provider = provider==="none"?"__NUXT__":provider;
-    }catch{}
-  }
 
-  // __NEXT_DATA__
-  const nextData = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
-  if (nextData){
-    try{
-      const obj = JSON.parse(nextData[1]);
-      const s = JSON.stringify(obj);
-      if (!title) title = s.match(/"productName"\s*:\s*"([^"]+)"/)?.[1] || s.match(/"name"\s*:\s*"([^"]+)"/)?.[1] || title;
-      ["couponPrice","finalPrice","discountedPrice","salePrice","lowPrice","price","totalPrice","optionPrice","dealPrice","memberPrice","cardPrice","instantDiscountPrice"]
-        .forEach(k=>pullAll(s, new RegExp('"' + k + '"\\s*:\\s*("?[-\\d\\.,]+"?)','gi')));
-      provider = provider==="none"?"__NEXT_DATA__":provider;
-    }catch{}
+      const keys = [
+        "couponPrice","finalPrice","discountedPrice","salePrice","lowPrice","price","totalPrice",
+        // 옵션/버전 배열에서 자주 쓰이는 키들:
+        "optionPrice","dealPrice","memberPrice","cardPrice","instantDiscountPrice"
+      ];
+      keys.forEach(k => pullAll(s, new RegExp(`"${k}"\\s*:\\s*("?[\\d,\\.]+\"?)`, "gi")));
+      provider = provider === "none" ? "__NUXT__" : provider;
+    } catch {}
   }
-
-  // 최후 SSR 텍스트
-  if (!title) title = html.match(/class="prod-buy-header__title"[^>]*>\s*([^<]+)\s*</)?.[1]?.trim() || title;
 
   return { title: title || null, prices, currency, provider };
 }
@@ -212,7 +190,11 @@ function parseInfo(html){
 // ---------- HTML 전역 후보 ----------
 function pickPriceFallback(html){
   const out = new Set();
-  const toNum = v => { const s=String(v??"").replace(/[^0-9.]/g,""); const n=s?Number(s):NaN; return Number.isFinite(n)&&n>0?Math.round(n):null; };
+  const toNum = v => {
+    const s = String(v ?? "").replace(/[^0-9.]/g, "");
+    const n = s ? Number(s) : NaN;
+    return Number.isFinite(n) && n > 0 ? n : null;
+  };
   const pushAll = re => { for (const m of html.matchAll(re)) { const n = toNum(m[1]); if (n) out.add(n); } };
 
   [
@@ -229,8 +211,4 @@ function pickPriceFallback(html){
     /"salePrice"\s*:\s*("?[\d,\.]+"?)/gi,
     /"lowPrice"\s*:\s*("?[\d,\.]+"?)/gi,
     /"price"\s*:\s*("?[\d,\.]+"?)/gi,
-    /"totalPrice"\s*:\s*("?[\d,\.]+"?)/gi
-  ].forEach(re=>pushAll(re));
-
-  return Array.from(out);
-}
+    /"totalPrice"\s*:\s*("?[\d,\.
