@@ -95,7 +95,7 @@ function setErr(msg){ if(!msg){$("err").style.display="none";} else {$("err").st
 function refreshTpl(){
   const name = $("pname").textContent !== "-" ? $("pname").textContent : "상품명";
   const price = $("pprice").textContent !== "-" ? $("pprice").textContent : "가격정보";
-  const link = $("deeplink").textContent && !$("deeplink").textContent.startsWith("(") ? $("deeplink").textContent : "쿠팡링크";
+  const link = $("deeplink").textContent && !$("deeplink").textContent.startsWith("(")? $("deeplink").textContent : "쿠팡링크";
   $("tpl").textContent = `【쿠팡】${name}
 가격: ${price}
 링크: ${link}
@@ -145,8 +145,18 @@ async function createDeeplink(url) {
 async function fillProductInfo(url) {
     $("pname").textContent = "(조회 중...)";
     $("pprice").textContent = "(조회 중...)";
-
-    const r = await fetch(ENDPOINT_INFO, {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url})});
+    
+    const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('상품정보 조회 시간 초과')), 10000));
+    
+    const r = await Promise.race([
+        fetch(ENDPOINT_INFO, {
+            method:"POST",
+            headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({url})
+        }),
+        timeoutPromise
+    ]);
+    
     const txt = await r.text();
     
     if (!r.ok) {
@@ -161,10 +171,7 @@ async function fillProductInfo(url) {
     }
     
     let title = j.title || "정보 없음";
-    // 정규식으로 ' - 국산생수' 와 같은 패턴 제거
-    title = title.replace(/\s*-\s*국산생수(?=\s|$)/, '');
-    title = title.replace(/^기타\s*-\s*/,"");
-
+    title = title.replace(/\s*-\s*[^|]+\|쿠팡$/, '').trim();
     $("pname").textContent = title;
     
     let price = j.price || "정보 없음";
@@ -186,14 +193,12 @@ $("btnDeep").onclick = async () => {
         $("pname").textContent="(조회 중...)";
         $("pprice").textContent="(조회 중...)";
 
-        // 딥링크를 먼저 생성하고, 응답에서 원본 URL을 받습니다.
         const originalUrl = await createDeeplink(url).catch(e => {
              setErr(e.message);
              $("deeplink").textContent = "(오류 발생)";
-             throw e; // 다음 로직이 실행되지 않도록 오류를 다시 던집니다.
+             throw e;
         });
 
-        // 원본 URL로 상품 정보를 조회합니다.
         await fillProductInfo(originalUrl).catch(e => {
              setErr(e.message);
              $("pname").textContent = "(오류 발생)";
