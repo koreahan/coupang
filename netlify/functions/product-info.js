@@ -1,5 +1,5 @@
 // Netlify Function v1 (Node 18+)
-// 쿠팡 상품명/최저가 파싱 - 429 방지 + 최저가 로직 강화
+// 쿠팡 상품명/최저가 파싱 - 안정판 (ScrapingBee 400 fix)
 const API = "https://app.scrapingbee.com/api/v1/";
 const { SCRAPINGBEE_KEY, SCRAPINGBEE_PREMIUM } = process.env;
 
@@ -26,7 +26,7 @@ exports.handler = async (event) => {
 
     const url = normalizeCoupangUrl(raw);
 
-    // HTML 가져오기 (429 방지: 순차 + 백오프 + Bee 캐시)
+    // 429 방지: 순차 + 지수 백오프 (문제된 cache/headers 제거)
     const fetchBeeHtml = async (ua, attempt = 1) => {
       const qs = new URLSearchParams({
         api_key: SCRAPINGBEE_KEY,
@@ -35,17 +35,10 @@ exports.handler = async (event) => {
         block_resources: "false",
         country_code: "kr",
         wait_for: "meta[property='og:title']",
-        device: ua,
         premium_proxy: SCRAPINGBEE_PREMIUM ? "true" : "false",
         timeout: "20000",
-        cache: "86400", // 하루 캐시
-        headers: JSON.stringify({
-          "Accept-Language": "ko-KR,ko;q=0.9",
-          "User-Agent":
-            ua === "mobile"
-              ? "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Mobile"
-              : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36",
-        }),
+        // device 파라미터는 일부 플랜에서만 동작할 수 있어 안전하게 분기
+        ...(ua === "mobile" ? { window_width: "390", window_height: "844" } : {})
       }).toString();
 
       const res = await fetch(API + "?" + qs);
@@ -67,16 +60,16 @@ exports.handler = async (event) => {
       html = await fetchBeeHtml("desktop");
     }
 
-    // 제목 추출
+    // 제목
     const title =
       pickFirst([
         rx1(html, /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)/i),
         rx1(html, /<meta[^>]+name=["']title["'][^>]+content=["']([^"']+)/i),
         rx1(html, /id=["']productTitle["'][^>]*>([^<]+)/i),
-        rx1Json(html, /<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi, (obj) => obj?.name),
+        rx1Json(html, /<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi, (o) => o?.name),
       ]) || null;
 
-    // 가격 후보 모으기
+    // 가격 후보 → 최저가
     const priceCandidates = uniqNums(
       []
         .concat(rxAllNums(html, /<meta[^>]+property=["']product:price:amount["'][^>]+content=["']?(\d[\d,.]*)/gi))
@@ -122,64 +115,11 @@ function normalizeCoupangUrl(u) {
   if (m) return `https://www.coupang.com/vp/products/${m[1]}`;
   return u;
 }
-function rx1(s, re) {
-  const m = re.exec(s || "");
-  return m ? sanitize(m[1]) : null;
-}
-function rxAllNums(s, re) {
-  const out = [];
-  let m;
-  while ((m = re.exec(s || ""))) {
-    const n = toNum(m[1]);
-    if (n) out.push(n);
-  }
-  return out;
-}
-function rx1Json(s, re, picker) {
-  let m;
-  while ((m = re.exec(s || ""))) {
-    try {
-      const obj = JSON.parse(m[1]);
-      const picked = picker(obj);
-      if (picked) return sanitize(picked);
-    } catch {}
-  }
-  return null;
-}
-function rxAllJson(s, re, picker) {
-  const out = [];
-  let m;
-  while ((m = re.exec(s || ""))) {
-    try {
-      const obj = JSON.parse(m[1]);
-      const val = picker(obj);
-      if (Array.isArray(val)) out.push(...val);
-      else if (val) out.push(val);
-    } catch {}
-  }
-  return out;
-}
-function toNum(x) {
-  if (x == null) return null;
-  const n = Number(String(x).replace(/[^\d.]/g, ""));
-  return Number.isFinite(n) ? Math.round(n) : null;
-}
-function uniqNums(arr) {
-  const set = new Set();
-  const out = [];
-  for (const n of arr) {
-    if (n == null) continue;
-    if (!set.has(n)) {
-      set.add(n);
-      out.push(n);
-    }
-  }
-  return out;
-}
-function pickFirst(arr) {
-  for (const v of arr) if (v) return v;
-  return null;
-}
-function sanitize(t) {
-  return String(t || "").replace(/\s+/g, " ").trim();
-}
+function rx1(s, re) { const m = re.exec(s || ""); return m ? sanitize(m[1]) : null; }
+function rxAllNums(s, re) { const out=[]; let m; while((m=re.exec(s||""))){ const n=toNum(m[1]); if(n) out.push(n);} return out; }
+function rx1Json(s, re, picker) { let m; while((m=re.exec(s||""))){ try{ const o=JSON.parse(m[1]); const v=picker(o); if(v) return sanitize(v);}catch{}} return null; }
+function rxAllJson(s, re, picker) { const out=[]; let m; while((m=re.exec(s||""))){ try{ const o=JSON.parse(m[1]); const v=picker(o); if(Array.isArray(v)) out.push(...v); else if(v) out.push(v);}catch{}} return out; }
+function toNum(x){ if(x==null) return null; const n=Number(String(x).replace(/[^\d.]/g,"")); return Number.isFinite(n)?Math.round(n):null; }
+function uniqNums(a){ const s=new Set(), o=[]; for(const n of a){ if(n==null) continue; if(!s.has(n)){ s.add(n); o.push(n);} } return o; }
+function pickFirst(a){ for(const v of a) if(v) return v; return null; }
+function sanitize(t){ return String(t||"").replace(/\s+/g," ").trim(); }
