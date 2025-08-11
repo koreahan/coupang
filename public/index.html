@@ -24,7 +24,7 @@
   </style>
 </head>
 <body>
-  <div class="badge">BUILD public/index.html · link-copy</div>
+  <div class="badge">BUILD public/index.html</div>
   <div class="wrap">
     <div class="card">
       <h1>쿠팡 딥링크 · 자동 채움</h1>
@@ -34,6 +34,7 @@
 
       <div class="row" style="margin-top:10px">
         <button id="btnGo" class="btn">딥링크 생성</button>
+        <button id="btnInfo" class="btn secondary">상품정보 채우기</button>
         <button id="btnCopy" class="btn secondary">템플릿 복사</button>
       </div>
 
@@ -97,13 +98,13 @@
     const text = await res.text(); let json; try{ json=JSON.parse(text);}catch{ json={ parseError:true, raw:text }; }
     return { ok:res.ok, status:res.status, json, text };
   };
-
-  function updateCopyLinkButton() {
+  const updateCopyLinkButton = ()=> {
     const link = $deeplink.textContent?.trim();
     const valid = link && !link.startsWith("(");
     $btnCopyLink.disabled = !valid;
-  }
+  };
 
+  // 1) 딥링크 생성
   $("btnGo").onclick = async () => {
     setErr(""); $raw.textContent="(요청 중...)";
     $deeplink.textContent="(생성 중...)"; $pname.textContent="-"; $pprice.textContent="-"; updateCopyLinkButton(); setTpl();
@@ -112,7 +113,6 @@
     if(!url){ setErr("쿠팡 링크를 입력하세요."); $deeplink.textContent="(아직 없음)"; updateCopyLinkButton(); return; }
 
     try{
-      // 1) 딥링크
       const deep = await postJSON(ENDPOINT_DEEP, { url });
       $raw.textContent = deep.text;
       if (!deep.json || deep.json.success === false) {
@@ -122,22 +122,8 @@
       $deeplink.textContent = link || "(생성 실패)";
       updateCopyLinkButton();
 
-      // 2) 상품정보 (최대 8초 대기, 실패 무시)
-      const ctrl = new AbortController(); const to = setTimeout(()=>ctrl.abort(), 8000);
-      try{
-        const r = await fetch(ENDPOINT_INFO, {
-          method:"POST", headers:{ "Content-Type":"application/json" },
-          body: JSON.stringify({ url }), signal: ctrl.signal
-        });
-        clearTimeout(to);
-        const txt = await r.text(); let j; try{ j=JSON.parse(txt);}catch{ j=null; }
-        $raw.textContent += "\n\n--- product-info ---\n" + (txt || "(empty)");
-        if (j?.success) {
-          if (j.info?.name)  $pname.textContent  = j.info.name;
-          if (Number.isFinite(j.info?.price)) $pprice.textContent = fmt(j.info.price);
-        }
-      }catch(_){ /* ignore */ }
-
+      // 딥링크 성공 직후 상품정보도 자동 채움
+      await fillProductInfo(url);
     }catch(e){
       setErr(e?.message || String(e));
     }finally{
@@ -145,20 +131,53 @@
     }
   };
 
+  // 2) 상품정보 채우기 (수동 버튼)
+  $("btnInfo").onclick = async () => {
+    const url = firstUrl($inp.value);
+    if(!url){ setErr("쿠팡 링크를 입력하세요."); return; }
+    await fillProductInfo(url, true);
+  };
+
+  // 3) 템플릿 복사
   $("btnCopy").onclick = async () => {
     await navigator.clipboard.writeText($tpl.textContent || "");
     alert("복사되었습니다.");
   };
 
+  // 4) 링크 복사
   $btnCopyLink.onclick = async () => {
     const link = $deeplink.textContent?.trim();
     if (!link || link.startsWith("(")) return;
     await navigator.clipboard.writeText(link);
-    // 간단 피드백
     const prev = $btnCopyLink.textContent;
     $btnCopyLink.textContent = "복사됨!";
     setTimeout(()=>{ $btnCopyLink.textContent = prev; }, 1200);
   };
+
+  // 상품정보 호출 + 화면 반영
+  async function fillProductInfo(url, appendRaw){
+    try{
+      const r = await fetch(ENDPOINT_INFO, {
+        method:"POST", headers:{ "Content-Type":"application/json" },
+        body: JSON.stringify({ url })
+      });
+      const txt = await r.text(); let j; try{ j=JSON.parse(txt);}catch{ j=null; }
+      if (appendRaw) $raw.textContent += "\n\n--- product-info ---\n" + (txt || "(empty)");
+
+      if (!j?.success) throw new Error(j?.error || "product-info 실패");
+
+      // 백엔드 최저가 우선 로직으로 내려온 값 그대로 사용
+      const title = j.title ?? "";
+      const price = j.price != null ? fmt(j.price) : "-";
+
+      if (title) $pname.textContent = title;
+      if (price) $pprice.textContent = price;
+
+      setTpl();
+    }catch(e){
+      setErr(e?.message || String(e));
+    }
+  }
 
   setTpl();
   updateCopyLinkButton();
