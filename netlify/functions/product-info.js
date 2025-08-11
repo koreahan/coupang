@@ -1,5 +1,4 @@
-// Netlify Function v1 (Node 18+)
-// 쿠팡 상품명/가격 추출 API
+// Netlify Function (최종 통합 버전)
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
@@ -21,8 +20,16 @@ exports.handler = async (event) => {
     }
 
     const finalUrl = await normalizeUrl(url);
-    const html = await getFastestHtml(finalUrl);
-    const parsed = parseInfo(html) || {};
+
+    // 1단계: 빠른 비렌더링 스크래핑 시도
+    let html = await getFastestHtml(finalUrl, { render: false, timeout: 5000 });
+    let parsed = parseInfo(html) || {};
+
+    // 2단계: 1단계에서 가격을 찾지 못했다면 느린 렌더링 스크래핑 시도
+    if (parsed.price === null) {
+      html = await getFastestHtml(finalUrl, { render: true, timeout: 15000, premium: true });
+      parsed = parseInfo(html) || parsed; // 기존에 찾은 title을 유지
+    }
 
     return json({
       success: true,
@@ -45,16 +52,13 @@ function json(obj, code = 200) {
   };
 }
 
-// URL 정규화: 짧은링크 해제 + 추적 파라미터 제거 + canonical 경로
 async function normalizeUrl(input) {
   let u = input.trim();
-
   if (u.includes("link.coupang.com")) {
     const r = await fetch(u, { method: "HEAD", redirect: "manual" });
     const loc = r.headers.get("location");
     if (loc) u = loc;
   }
-
   const url = new URL(u);
   [
     "redirect","src","addtag","itime","lptag","wTime","wPcid","wRef","traceid",
@@ -63,69 +67,43 @@ async function normalizeUrl(input) {
     "deviceid","token","contenttype","subid","sig","impressionid","campaigntype",
     "puid","requestid","ctime","contentkeyword","portal","landing_exp","subparam"
   ].forEach(p => url.searchParams.delete(p));
-
   const m = url.pathname.match(/\/(vp\/)?products\/(\d+)/);
   return m ? `https://www.coupang.com/vp/products/${m[2]}` : url.toString();
 }
 
-// 병렬 시도: 데스크톱/모바일, 렌더/비렌더
-async function getFastestHtml(finalUrl) {
-  const attempts = [
-    () => scrapeWithScrapingBee(finalUrl, 6500, desktopHeaders(), true),
-    () => scrapeWithScrapingBee(finalUrl, 6500, mobileHeaders(), true),
-    () => scrapeWithScrapingBee(finalUrl, 2500, desktopHeaders(), false),
-  ];
-  const settled = await Promise.allSettled(attempts.map(fn => fn()));
-  const ok = settled.find(r => r.status === "fulfilled");
-  if (ok) return ok.value;
-
-  const reasons = settled
-    .map(r => r.status === "rejected" ? String(r.reason) : "")
-    .filter(Boolean);
-  throw new Error("All attempts failed: " + reasons.join(" | "));
+async function getFastestHtml(finalUrl, options) {
+  try {
+    const html = await scrapeWithScrapingBee(finalUrl, options);
+    if (/Sorry!\s*Access\s*denied/i.test(html) || html.length < 2000) {
+      throw new Error('BLOCKED_PAGE');
+    }
+    return html;
+  } catch (e) {
+    throw new Error(`스크래핑 실패: ${e.message}`);
+  }
 }
 
-function desktopHeaders() {
-  return {
-    "User-Agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-  };
-}
-function mobileHeaders() {
-  return {
-    "User-Agent":
-      "Mozilla/5.0 (Linux; Android 13; SM-S908N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36",
-    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-  };
-}
-
-// ScrapingBee 호출
-async function scrapeWithScrapingBee(url, timeoutMs, headers, render = true) {
+async function scrapeWithScrapingBee(url, options) {
   const apiKey = process.env.SCRAPINGBEE_KEY;
   if (!apiKey) throw new Error("Missing SCRAPINGBEE_KEY");
-
   const params = {
     api_key: apiKey,
     url,
-    render_js: render ? "true" : "false",
-    ...(process.env.SCRAPINGBEE_PREMIUM === "1" ? { premium_proxy: "true" } : {}),
+    render_js: options.render ? "true" : "false",
+    ...(options.premium ? { premium_proxy: "true" } : {}),
     country_code: "kr",
-    ...(render
-      ? { wait_for: 'meta[property="og:title"], script[type="application/ld+json"]' }
-      : {}),
+    ...(options.render ? { wait: "3000", wait_for: 'meta[property="og:title"], script[type="application/ld+json"]' } : {}),
     forward_headers: "true",
   };
   const qs = new URLSearchParams(params);
-
+  const headers = { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36" };
   const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  const t = setTimeout(() => ctrl.abort(), options.timeout);
   const res = await fetch(`https://app.scrapingbee.com/api/v1?${qs}`, {
     method: "GET",
     headers,
     signal: ctrl.signal,
   }).finally(() => clearTimeout(t));
-
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new Error(`ScrapingBee ${res.status} ${body}`);
@@ -154,10 +132,7 @@ function parseInfo(html) {
     .map(m => { try { return JSON.parse(m[1]); } catch { return null; } })
     .filter(Boolean)
     .flatMap(o => Array.isArray(o) ? o : (o['@graph'] ? o['@graph'] : [o]));
-
-  const prod = ldBlocks.find(o =>
-    (o['@type'] === 'Product' || o['@type']?.includes?.('Product') || o.name)
-  );
+  const prod = ldBlocks.find(o => (o['@type'] === 'Product' || o['@type']?.includes?.('Product') || o.name));
   if (prod) {
     provider = 'json-ld';
     if (prod.name) title = prod.name;
@@ -172,8 +147,7 @@ function parseInfo(html) {
   }
 
   // 2. og:title 파싱
-  const og = html.match(/<meta property="og:title" content="([^"]+)"/)
-    || html.match(/<meta name="title" content="([^"]+)"/);
+  const og = html.match(/<meta property="og:title" content="([^"]+)"/) || html.match(/<meta name="title" content="([^"]+)"/);
   if (!title && og?.[1]) {
     title = og[1];
     provider = provider === 'none' ? 'meta' : provider;
@@ -198,6 +172,7 @@ function parseInfo(html) {
     /aria-label="가격\s*([\d,.]+)\s*원"/gi,
     /data-price="([\d,.]+)"/gi,
     /data-rt-price="([\d,.]+)"/gi,
+    /id="priceValue"[\s\S]*?([\d,.]+)/gi, // 새로운 패턴 추가
   ];
   pricePatterns.forEach(pushAll);
 
