@@ -81,7 +81,6 @@ pre{white-space:pre-wrap;word-break:break-all;background:#f9fafb;border:1px soli
 const $ = id => document.getElementById(id);
 const ENDPOINT_DEEP = "/.netlify/functions/create-deeplink";
 const ENDPOINT_INFO = "/.netlify/functions/product-info";
-const ENDPOINT_INFO_SLOW = "/.netlify/functions/product-info-slow";
 
 function firstUrl(input) {
   const m = String(input || "").match(/https?:\/\/[^\s]+/i);
@@ -93,8 +92,12 @@ function fmtKRW(n) {
   return Number(n||0).toLocaleString("ko-KR")+"원"; 
 }
 function setErr(msg){ if(!msg){$("err").style.display="none";} else {$("err").style.display="block";$("err").textContent=msg;} }
+
+// 템플릿 미리보기 전용 정제 로직 추가
 function refreshTpl(){
-  const name = $("pname").textContent !== "-" ? $("pname").textContent : "상품명";
+  let name = $("pname").textContent !== "-" ? $("pname").textContent : "상품명";
+  // 템플릿에만 적용되는 상품명 정제 로직
+  name = name.replace(/\s*-\s*[^|]+\|쿠팡$/, '').trim();
   const price = $("pprice").textContent !== "-" ? $("pprice").textContent : "가격정보";
   const link = $("deeplink").textContent && !$("deeplink").textContent.startsWith("(")? $("deeplink").textContent : "쿠팡링크";
   $("tpl").textContent = `【쿠팡】${name}
@@ -143,18 +146,11 @@ async function createDeeplink(url) {
     return originalLink;
 }
 
-async function fillProductInfo(url, useSlowEndpoint = false) {
+async function fillProductInfo(url) {
     $("pname").textContent = "(조회 중...)";
     $("pprice").textContent = "(조회 중...)";
-    
-    const endpoint = useSlowEndpoint ? ENDPOINT_INFO_SLOW : ENDPOINT_INFO;
-    
-    const r = await fetch(endpoint, {
-        method:"POST",
-        headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({url})
-    });
-    
+
+    const r = await fetch(ENDPOINT_INFO, {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url})});
     const txt = await r.text();
     
     if (!r.ok) {
@@ -162,21 +158,20 @@ async function fillProductInfo(url, useSlowEndpoint = false) {
     }
 
     const j = JSON.parse(txt);
-    $("raw").textContent += `\n\n--- product-info (${useSlowEndpoint ? '느린' : '빠른'}) ---\n` + txt;
+    $("raw").textContent += "\n\n--- product-info ---\n" + txt;
     
     if(!j.success) {
         throw new Error(j.error || "상품정보 조회 실패");
     }
     
     let title = j.title || "정보 없음";
-    title = title.replace(/\s*-\s*[^|]+\|쿠팡$/, '').trim();
     $("pname").textContent = title;
     
     let price = j.price || "정보 없음";
     $("pprice").textContent = fmtKRW(price);
     
     refreshTpl();
-    return j.price;
+    return true;
 }
 
 $("btnDeep").onclick = async () => {
@@ -197,23 +192,11 @@ $("btnDeep").onclick = async () => {
              throw e;
         });
 
-        // 1단계: 빠른 조회 시도
-        let price = null;
-        try {
-            price = await fillProductInfo(originalUrl, false);
-        } catch(e) {
-            console.error('빠른 조회 실패, 느린 조회로 재시도합니다.');
-            setErr("가격 조회 실패, 느린 방법으로 재시도합니다...");
-        }
-
-        // 2단계: 가격을 찾지 못했거나 실패했다면 느린 조회 시도
-        if (price === null) {
-            await fillProductInfo(originalUrl, true).catch(e => {
-                setErr(e.message);
-                $("pname").textContent = "(오류 발생)";
-                $("pprice").textContent = "(오류 발생)";
-            });
-        }
+        await fillProductInfo(originalUrl).catch(e => {
+             setErr(e.message);
+             $("pname").textContent = "(오류 발생)";
+             $("pprice").textContent = "(오류 발생)";
+        });
 
     }catch(e){ 
         // 전역 오류 처리
@@ -229,7 +212,7 @@ $("btnInfo").onclick = async () => {
         const url = firstUrl($("inp").value);
         if(!url){ setErr("쿠팡 링크를 입력하세요."); return; }
         
-        await fillProductInfo(url, true);
+        await fillProductInfo(url);
     }catch(e){ 
         setErr(e.message); 
     }finally{ 
