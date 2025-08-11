@@ -1,24 +1,38 @@
 // Netlify Function v1 (Node 18+)
-// 쿠팡 상품명/최저가 추출 (딥링크와 무관, 짧은링크 해체 포함)
+// 쿠팡 상품명/최저가 추출 (딥링크와 무관)
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
+// ===== 동시성 429 방지: 서버 측 직렬화 큐 =====
+let _queue = Promise.resolve();
+function withQueue(fn) {
+  const run = _queue.then(fn, fn);
+  _queue = run.catch(() => {}); // 실패해도 다음 작업 흐름 유지
+  return run;
+}
+
 exports.handler = async (event) => {
   try {
-    if (event.httpMethod === "OPTIONS") return { statusCode: 200, headers: CORS, body: "" };
-    if (event.httpMethod !== "POST") return { statusCode: 405, headers: CORS, body: "POST only" };
+    if (event.httpMethod === "OPTIONS") {
+      return { statusCode: 200, headers: CORS, body: "" };
+    }
+    if (event.httpMethod !== "POST") {
+      return { statusCode: 405, headers: CORS, body: "POST only" };
+    }
 
     const { url } = JSON.parse(event.body || "{}");
     if (!url) return json({ success:false, error:"No URL provided" }, 400);
 
-    const finalUrl = await normalizeUrl(url);     // 짧은링크 해체 + itemId/vendorItemId 보존
-    const html = await getFastestHtml(finalUrl);
+    const finalUrl = await normalizeUrl(url);
+
+    // 큐로 직렬화하여 ScrapingBee 429 완화
+    const html = await withQueue(() => getFastestHtml(finalUrl));
 
     const parsed = parseInfo(html) || { title:null, prices:[], currency:"KRW", provider:"none" };
-    const fallback = pickPriceFallback(html);     // 배열
+    const fallback = pickPriceFallback(html); // number[]
 
     const all = [
       ...(parsed.prices || []),
@@ -31,13 +45,13 @@ exports.handler = async (event) => {
       success: true,
       finalUrl,
       title: parsed.title ?? null,
-      price: minPrice != null ? String(minPrice) : null, // 최저가
+      price: minPrice != null ? String(minPrice) : null, // ✅ 최저가 숫자 문자열
       currency: parsed.currency ?? "KRW",
       provider: parsed.provider ?? null,
-      debug: { priceCandidates: all.slice(0, 20) },
+      debug: { priceCandidates: all.slice(0, 20), htmlBytes: html.length }
     });
-  } catch (e) {
-    return json({ success:false, error:String(e?.message || e) }, 500);
+  } catch (err) {
+    return json({ success:false, error:String(err?.message || err) }, 500);
   }
 };
 
@@ -49,7 +63,7 @@ function json(obj, code=200){
 async function normalizeUrl(input){
   let u = String(input || "").trim();
 
-  // link.coupang.com 짧은링크 → 원본으로
+  // link.coupang.com 짧은링크 → 원본으로 (HEAD, redirect 수동 추적)
   if (u.includes("link.coupang.com")) {
     const r = await fetch(u, { method: "HEAD", redirect: "manual" });
     const loc = r.headers.get("location");
@@ -80,19 +94,36 @@ async function normalizeUrl(input){
   return out.toString();
 }
 
-// ---------- 스크래핑 ----------
-async function getFastestHtml(finalUrl){
-  const attempts = [
-    () => scrapeWithScrapingBee(finalUrl, 12000, desktopHeaders(), true),
-    () => scrapeWithScrapingBee(finalUrl, 12000, mobileHeaders(),  true),
-    () => scrapeWithScrapingBee(finalUrl,  6000, desktopHeaders(), false),
+// ---------- 스크래핑: 사다리식 재시도 + 429 백오프 + 차단 감지 ----------
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function getFastestHtml(finalUrl) {
+  // 우선 성공률 높은 프리미엄+모바일 렌더 → 데스크톱 렌더 → 일반 렌더 → 비렌더
+  const ladder = [
+    { render:true,  headers: mobileHeaders(),  timeout:12000, premium:true  },
+    { render:true,  headers: desktopHeaders(), timeout:12000, premium:true  },
+    { render:true,  headers: mobileHeaders(),  timeout:12000, premium:false },
+    { render:true,  headers: desktopHeaders(), timeout:12000, premium:false },
+    { render:false, headers: desktopHeaders(), timeout: 6000, premium:false },
   ];
-  try { return await Promise.any(attempts.map(fn => fn())); }
-  catch {
-    const settled = await Promise.allSettled(attempts.map(fn => fn()));
-    const reasons = settled.map(r => r.status === "rejected" ? String(r.reason) : "").filter(Boolean);
-    throw new Error("All attempts failed: " + reasons.join(" | "));
+
+  let lastErr;
+  for (const step of ladder) {
+    for (let i=0;i<2;i++) { // 2회 재시도 (429만 백오프)
+      try {
+        const html = await scrapeWithScrapingBee(finalUrl, step.timeout, step.headers, step.render, step.premium);
+        // 차단/빈문서 감지
+        if (/Sorry!\s*Access\s*denied/i.test(html) || html.length < 2000) throw new Error('BLOCKED_PAGE');
+        return html;
+      } catch (e) {
+        lastErr = e;
+        const msg = String(e?.message || e);
+        if (msg.includes('HTTP_429')) { await sleep(1000 * (i+1)); continue; } // 1s → 2s
+        break; // 차단/기타 → 다음 단계
+      }
+    }
   }
+  throw lastErr || new Error('All attempts failed');
 }
 
 function desktopHeaders(){ return {
@@ -104,7 +135,7 @@ function mobileHeaders(){ return {
   "Accept-Language":"ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7"
 };}
 
-async function scrapeWithScrapingBee(url, timeoutMs, headers, render=true){
+async function scrapeWithScrapingBee(url, timeoutMs, headers, render=true, premium=false){
   const apiKey = process.env.SCRAPINGBEE_KEY;
   if (!apiKey) throw new Error("Missing SCRAPINGBEE_KEY");
 
@@ -114,7 +145,7 @@ async function scrapeWithScrapingBee(url, timeoutMs, headers, render=true){
     render_js: render ? "true" : "false",
     country_code: "kr",
     ...(render ? { wait:"2000", wait_for:'meta[property="og:title"], script[type="application/ld+json"]' } : {}),
-    ...(process.env.SCRAPINGBEE_PREMIUM === "1" ? { premium_proxy:"true" } : {}),
+    ...(premium ? { premium_proxy:"true" } : {}),
     forward_headers: "true",
   };
   const qs = new URLSearchParams(params);
@@ -123,15 +154,14 @@ async function scrapeWithScrapingBee(url, timeoutMs, headers, render=true){
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const res = await fetch(`https://app.scrapingbee.com/api/v1?${qs}`, { method:"GET", headers, signal: ctrl.signal });
-    if (!res.ok) {
-      const body = await res.text().catch(()=> "");
-      throw new Error(`ScrapingBee ${res.status} ${body.slice(0,300)}`);
-    }
-    return res.text();
+    const text = await res.text();
+    if (res.status === 429) throw new Error('HTTP_429 ' + text);
+    if (!res.ok)  throw new Error(`ScrapingBee ${res.status} ${text.slice(0,300)}`);
+    return text;
   } finally { clearTimeout(t); }
 }
 
-// ---------- 파싱(정규식은 전부 RegExp로 안전 처리) ----------
+// ---------- 파싱(모든 후보 수집) ----------
 function parseInfo(html){
   const prices = [];
   let title = null, currency = "KRW", provider = "none";
@@ -167,30 +197,32 @@ function parseInfo(html){
     }
   }
 
-  // og / <title>
-  const reOg1 = new RegExp('<meta property="og:title" content="([^"]+)"', 'i');
-  const reOg2 = new RegExp('<meta name="title" content="([^"]+)"', 'i');
-  const og = html.match(reOg1) || html.match(reOg2);
-  if (!title && og?.[1]) { title = og[1]; provider = provider === "none" ? "meta" : provider; }
+  // og:title → 없으면 <title> (차단 제목은 무시)
+  const m1 = html.match(new RegExp('<meta property="og:title" content="([^"]+)"','i'));
+  const m2 = html.match(new RegExp('<meta name="title" content="([^"]+)"','i'));
+  if (!title && (m1?.[1] || m2?.[1])) { title = (m1?.[1] || m2?.[1]); provider = provider === "none" ? "meta" : provider; }
   if (!title){
-    const reTitle = new RegExp('<title>([^<]+)<\\/title>', 'i');
-    const t = html.match(reTitle);
-    if (t?.[1]) { title = t[1].trim(); provider = provider === "none" ? "title" : provider; }
+    const t = html.match(new RegExp('<title>([^<]+)<\\/title>','i'));
+    const tt = t?.[1]?.trim();
+    if (tt && !/Sorry!\s*Access\s*denied/i.test(tt)) {
+      title = tt; provider = provider === "none" ? "title" : provider;
+    }
   }
 
-  // __NUXT__
+  // __NUXT__ 내부
   const reNuxt = new RegExp('window\\.__NUXT__\\s*=\\s*(\\{[\\s\\S]*?\\});');
   const nuxt = html.match(reNuxt);
   if (nuxt){
     try{
       const s = JSON.stringify(JSON.parse(nuxt[1]));
       if (!title) {
-        const m1 = s.match(new RegExp('"productName"\\s*:\\s*"([^"]+)"'));
-        const m2 = s.match(new RegExp('"name"\\s*:\\s*"([^"]+)"'));
-        title = (m1?.[1] || m2?.[1] || title);
+        const n1 = s.match(new RegExp('"productName"\\s*:\\s*"([^"]+)"'));
+        const n2 = s.match(new RegExp('"name"\\s*:\\s*"([^"]+)"'));
+        title = n1?.[1] || n2?.[1] || title;
       }
-      const keys = ["couponPrice","finalPrice","discountedPrice","salePrice","lowPrice","price","totalPrice","optionPrice","dealPrice","memberPrice","cardPrice","instantDiscountPrice"];
-      keys.forEach(k => pullAll(s, new RegExp(`"${k}"\\s*:\\s*("?[\\d,\\.]+\"?)`, "gi")));
+      // 다양한 가격 키들 전체 수집
+      ["couponPrice","finalPrice","discountedPrice","salePrice","lowPrice","price","totalPrice","optionPrice","dealPrice","memberPrice","cardPrice","instantDiscountPrice"]
+        .forEach(k => pullAll(s, new RegExp(`"${k}"\\s*:\\s*("?[\\d,\\.]+\"?)`, "gi")));
       provider = provider === "none" ? "__NUXT__" : provider;
     } catch {}
   }
