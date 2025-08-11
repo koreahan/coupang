@@ -1,219 +1,182 @@
 <!DOCTYPE html>
 <html lang="ko">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>쿠팡 딥링크 · 자동 채움</title>
-  <style>
-    body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,Apple SD Gothic Neo,Nanum Gothic,sans-serif;background:#f6f7f9;margin:0}
-    .wrap{max-width:720px;margin:24px auto;padding:0 16px}
-    .card{background:#fff;border:1px solid #e5e7eb;border-radius:16px;padding:16px;box-shadow:0 2px 12px rgba(0,0,0,.05)}
-    h1{font-size:20px;margin:0 0 12px}
-    label{font-size:13px;color:#666;display:block;margin:12px 0 6px}
-    input[type=text]{width:100%;padding:14px;border:1px solid #e5e7eb;border-radius:12px;font-size:16px}
-    .btn{background:#111;color:#fff;border:0;border-radius:12px;padding:10px 14px;font-size:14px;cursor:pointer}
-    .btn.secondary{background:#fff;color:#111;border:1px solid #e5e7eb}
-    .btn.small{padding:6px 10px;font-size:12px;border-radius:10px}
-    .row{display:flex;gap:8px;flex-wrap:wrap}
-    .row-between{display:flex;align-items:center;justify-content:space-between;gap:8px}
-    .out{background:#fafafa;border:1px solid #e5e7eb;border-radius:12px;padding:12px;min-height:40px;font-size:14px;word-break:break-all}
-    .error{color:#b00020;background:#fff1f1;border:1px solid #f3c2c2;padding:10px 12px;border-radius:10px;font-size:13px}
-    pre{white-space:pre-wrap;word-break:break-all;background:#f9fafb;border:1px solid #e5e7eb;border-radius:12px;padding:12px;font-size:12px;max-height:320px;overflow:auto}
-    .badge{position:fixed;top:8px;left:8px;background:#111;color:#fff;padding:4px 8px;border-radius:8px;font:12px/1.4 system-ui;z-index:9999}
-    .muted{color:#666;font-size:12px}
-  </style>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>쿠팡 딥링크 · 자동 채움</title>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,Apple SD Gothic Neo,Nanum Gothic,sans-serif;background:#f6f7f9;margin:0}
+.wrap{max-width:720px;margin:24px auto;padding:0 16px}
+.card{background:#fff;border:1px solid #e5e7eb;border-radius:16px;padding:16px;box-shadow:0 2px 12px rgba(0,0,0,.05)}
+h1{font-size:20px;margin:0 0 12px}
+label{font-size:13px;color:#666;display:block;margin:12px 0 6px}
+input[type=text]{width:100%;padding:14px;border:1px solid #e5e7eb;border-radius:12px;font-size:16px}
+.btn{background:#111;color:#fff;border:0;border-radius:12px;padding:10px 14px;font-size:14px;cursor:pointer}
+.btn.secondary{background:#fff;color:#111;border:1px solid #e5e7eb}
+.btn.small{padding:6px 10px;font-size:12px;border-radius:10px}
+.row{display:flex;gap:8px;flex-wrap:wrap}
+.row-between{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.out{background:#fafafa;border:1px solid #e5e7eb;border-radius:12px;padding:12px;min-height:40px;font-size:14px;word-break:break-all}
+.error{color:#b00020;background:#fff1f1;border:1px solid #f3c2c2;padding:10px 12px;border-radius:10px;font-size:13px}
+pre{white-space:pre-wrap;word-break:break-all;background:#f9fafb;border:1px solid #e5e7eb;border-radius:12px;padding:12px;font-size:12px;max-height:320px;overflow:auto}
+.muted{color:#666;font-size:12px}
+</style>
 </head>
 <body>
-  <div class="badge">BUILD public/index.html</div>
-  <div class="wrap">
-    <div class="card">
-      <h1>쿠팡 딥링크 · 자동 채움</h1>
+<div class="wrap">
+  <div class="card">
+    <h1>쿠팡 딥링크 · 자동 채움</h1>
 
-      <label>문장 전체 붙여넣기 OK (첫 번째 http(s)만 인식)</label>
-      <input id="inp" type="text" placeholder="예) 쿠팡을 추천합니다! https://link.coupang.com/a/XXXXX" autocomplete="off" autocapitalize="off" />
+    <label>문장 전체 붙여넣기 OK (첫 번째 http(s)만 인식)</label>
+    <input id="inp" type="text" placeholder="예) 쿠팡을 추천합니다! https://link.coupang.com/a/XXXXX" autocomplete="off" />
 
-      <div class="row" style="margin-top:10px">
-        <button id="btnGo" class="btn">딥링크 생성</button>
-        <button id="btnInfo" class="btn secondary">상품정보 채우기</button>
-        <button id="btnCopy" class="btn secondary">템플릿 복사</button>
-      </div>
-
-      <div id="err" class="error" style="display:none;margin-top:10px"></div>
-
-      <div class="row-between" style="margin-top:14px">
-        <label style="margin:0">파트너스 링크</label>
-        <button id="btnCopyLink" class="btn secondary small" disabled>링크 복사</button>
-      </div>
-      <div id="deeplink" class="out">(아직 없음)</div>
-      <div class="muted">* 링크가 생성되면 ‘링크 복사’ 버튼이 활성화됩니다.</div>
-
-      <div class="row" style="margin-top:10px">
-        <div style="flex:1;min-width:220px">
-          <label>상품명(자동)</label>
-          <div id="pname" class="out">-</div>
-        </div>
-        <div style="flex:1;min-width:160px">
-          <label>가격(원, 자동)</label>
-          <div id="pprice" class="out">-</div>
-        </div>
-      </div>
-
-      <label style="margin-top:14px">템플릿 미리보기</label>
-      <pre id="tpl" class="out"></pre>
-
-      <details style="margin-top:14px">
-        <summary>RAW 응답(JSON)</summary>
-        <pre id="raw">(없음)</pre>
-      </details>
+    <div class="row" style="margin-top:10px">
+      <button id="btnDeep" class="btn">딥링크 생성</button>
+      <button id="btnInfo" class="btn secondary">상품정보 채우기</button>
+      <button id="btnCopy" class="btn secondary">템플릿 복사</button>
     </div>
+
+    <div id="err" class="error" style="display:none;margin-top:10px"></div>
+
+    <div class="row-between" style="margin-top:14px">
+      <label style="margin:0">파트너스 링크</label>
+      <button id="btnCopyLink" class="btn secondary small" disabled>링크 복사</button>
+    </div>
+    <div id="deeplink" class="out">(아직 없음)</div>
+    <div class="muted">* 링크가 생성되면 ‘링크 복사’ 버튼이 활성화됩니다.</div>
+
+    <div class="row" style="margin-top:10px">
+      <div style="flex:1;min-width:220px">
+        <label>상품명(자동)</label>
+        <div id="pname" class="out">-</div>
+      </div>
+      <div style="flex:1;min-width:160px">
+        <label>가격(원, 자동)</label>
+        <div id="pprice" class="out">-</div>
+      </div>
+    </div>
+
+    <label style="margin-top:14px">템플릿 미리보기</label>
+    <pre id="tpl" class="out"></pre>
+
+    <details style="margin-top:14px">
+      <summary>RAW 응답(JSON)</summary>
+      <pre id="raw">(없음)</pre>
+    </details>
   </div>
+</div>
 
 <script>
-const $ = (id) => document.getElementById(id);
-const $inp = $("inp"), $err = $("err"), $raw = $("raw");
-const $deeplink = $("deeplink"), $pname = $("pname"), $pprice = $("pprice"), $tpl = $("tpl");
-const $btnGo = $("btnGo"), $btnInfo = $("btnInfo"), $btnCopy = $("btnCopy"), $btnCopyLink = $("btnCopyLink");
-
+const $ = id => document.getElementById(id);
 const ENDPOINT_DEEP = "/.netlify/functions/create-deeplink";
 const ENDPOINT_INFO = "/.netlify/functions/product-info";
 
-let PARTNER_LINK = "";
-let BUSY = false;
-const COOL_DOWN_MS = 800;
-
-const firstUrl = (s) => (String(s||"").match(/https?:\/\/[^\s]+/)||[])[0] || "";
-const fmtKRW = (n) => Number(n||0).toLocaleString("ko-KR")+"원";
-const setErr = (msg)=>{ if(!msg){$err.style.display="none";$err.textContent="";} else {$err.style.display="block";$err.textContent=msg;} };
-function updateCopyLinkButton(){
-  const valid = !!PARTNER_LINK;
-  if ($btnCopyLink) $btnCopyLink.disabled = !valid;
+function firstUrl(input) {
+  const m = String(input || "").match(/https?:\/\/[^\s]+/i);
+  if (!m) return "";
+  return m[0].replace(/[)\]\},>.]+$/g, "");
 }
+function fmtKRW(n) { return Number(n||0).toLocaleString("ko-KR")+"원"; }
+function setErr(msg){ if(!msg){$("err").style.display="none";} else {$("err").style.display="block";$("err").textContent=msg;} }
 function refreshTpl(){
-  const name = $pname?.textContent && $pname.textContent !== "-" ? $pname.textContent : "상품명";
-  const price = $pprice?.textContent && $pprice.textContent !== "-" ? $pprice.textContent : "가격정보";
-  const link  = PARTNER_LINK || "쿠팡링크";
-  $tpl.textContent = `【쿠팡】${name}
+  const name = $("pname").textContent !== "-" ? $("pname").textContent : "상품명";
+  const price = $("pprice").textContent !== "-" ? $("pprice").textContent : "가격정보";
+  const link = $("deeplink").textContent && !$("deeplink").textContent.startsWith("(") ? $("deeplink").textContent : "쿠팡링크";
+  $("tpl").textContent = `【쿠팡】${name}
 가격: ${price}
 링크: ${link}
 
 ※ 모든 핫딜은 카드 할인 및 쿠폰 적용가 기준입니다.
 ※ 이 포스팅은 쿠팡파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받습니다. 구입 시 제품 가격에는 아무런 영향이 없습니다.`;
 }
-function sanitizeTitle(t){
-  if (!t) return t;
-  let s = String(t).replace(/\s+/g,' ').trim();
-  if (s.includes('>')) s = s.split('>').pop().trim();
-  s = s.replace(/^\s*(?:\[[^\]]+\]|\([^)]+\))\s*/g, '');
-  s = s.replace(/^(?:기타|식품|잡화|생활용품|베이커리|디저트|간식|스낵)\s*[-/·]?\s*/i, '');
-  s = s.replace(/\s{2,}/g,' ').trim();
-  return s;
-}
-function setBusy(on, label){
+
+let BUSY = false;
+function setBusy(on) {
   BUSY = on;
-  const btns = [$btnGo, $btnInfo, $btnCopy, $btnCopyLink].filter(Boolean);
-  if (on){
-    btns.forEach(b=>{
-      b.dataset._prev = b.textContent;
-      b.textContent = label || "로딩중…";
-      b.disabled = true;
-    });
-  } else {
-    setTimeout(()=>{
-      btns.forEach(b=>{
-        if (b.dataset._prev){ b.textContent = b.dataset._prev; delete b.dataset._prev; }
-        b.disabled = false;
-      });
-    }, COOL_DOWN_MS);
-  }
+  ["btnDeep","btnInfo","btnCopy","btnCopyLink"].forEach(id => {
+    const b = $(id); if(b) b.disabled = on;
+  });
 }
-async function withBusy(fn, label){
-  if (BUSY) return;
-  setBusy(true, label);
-  try { return await fn(); }
-  finally { setBusy(false); }
-}
+
 function resetUI(){
-  PARTNER_LINK = "";
-  if ($inp) $inp.value = "";
-  if ($deeplink) $deeplink.textContent = "(아직 없음)";
-  if ($pname) $pname.textContent = "-";
-  if ($pprice) $pprice.textContent = "-";
-  if ($raw) $raw.textContent = "(없음)";
+  $("inp").value="";
+  $("deeplink").textContent="(아직 없음)";
+  $("pname").textContent="-";
+  $("pprice").textContent="-";
+  $("raw").textContent="(없음)";
+  $("btnCopyLink").disabled = true;
   setErr("");
-  updateCopyLinkButton();
-  refreshTpl();
-}
-async function createDeeplink(url){
-  const res = await fetch(ENDPOINT_DEEP, {
-    method:"POST", headers:{ "Content-Type":"application/json" },
-    body: JSON.stringify({ url })
-  });
-  const txt = await res.text(); let j; try{ j = JSON.parse(txt);}catch{ j=null; }
-  if ($raw) $raw.textContent = txt;
-  if (!j || j.success === false) throw new Error(j?.error || "딥링크 생성 실패");
-
-  const link = j.deeplink || j.link || j.data?.[0]?.shortenUrl || j.data?.[0]?.deeperUrl || "";
-  if (!link) throw new Error("딥링크 생성 실패");
-
-  PARTNER_LINK = link;
-  if ($deeplink) $deeplink.textContent = PARTNER_LINK;
-  updateCopyLinkButton();
-  refreshTpl();
-}
-async function fillProductInfo(url){
-  const res = await fetch(ENDPOINT_INFO, {
-    method:"POST", headers:{ "Content-Type":"application/json" },
-    body: JSON.stringify({ url })
-  });
-  const txt = await res.text(); let j; try{ j = JSON.parse(txt);}catch{ j = { success:false, error:"Non-JSON", raw:txt }; }
-  if ($raw) $raw.textContent = txt;
-  if (!j.success) throw new Error(j.error || "상품정보 실패");
-
-  if ($pname && j.title) $pname.textContent = sanitizeTitle(j.title);
-  if ($pprice && j.price) $pprice.textContent = fmtKRW(j.price);
   refreshTpl();
 }
 
-$btnGo && ($btnGo.onclick = () => withBusy(async () => {
-  setErr("");
-  PARTNER_LINK = "";
-  if ($deeplink) $deeplink.textContent = "(생성 중...)";
-  if ($raw) $raw.textContent = "(요청 중...)";
-  updateCopyLinkButton(); refreshTpl();
+async function createDeeplink(url) {
+  const r = await fetch(ENDPOINT_DEEP, {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url})});
+  const txt = await r.text(); $("raw").textContent = txt;
+  const j = JSON.parse(txt);
+  if(!j.success) throw new Error(j.error || "딥링크 실패");
+  const link = j.deeplink || j.link || j.data?.[0]?.shortenUrl;
+  if(!link) throw new Error("딥링크 없음");
+  $("deeplink").textContent = link;
+  $("btnCopyLink").disabled = false;
+}
 
-  const url = firstUrl($inp?.value);
-  if (!url) { setErr("쿠팡 링크를 입력하세요."); if ($deeplink) $deeplink.textContent = "(아직 없음)"; updateCopyLinkButton(); refreshTpl(); return; }
+async function fillProductInfo(url) {
+  const r = await fetch(ENDPOINT_INFO, {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url})});
+  const txt = await r.text();
+  const j = JSON.parse(txt);
+  $("raw").textContent += "\n\n--- product-info ---\n" + txt;
+  if(!j.success) throw new Error(j.error || "상품정보 실패");
+  let title = j.title || "";
+  title = title.replace(/^기타\s*-\s*/,""); // "기타-" 제거
+  if(title) $("pname").textContent = title;
+  if(j.price) $("pprice").textContent = fmtKRW(j.price);
 
-  try { await createDeeplink(url); }
-  catch(e) { setErr(String(e?.message || e)); }
-}, "딥링크 생성중…"));
+  // 상품정보만 불러와도, deeplink가 있으면 복사 버튼 활성화
+  const dl = $("deeplink").textContent;
+  if(dl && !dl.startsWith("(")) $("btnCopyLink").disabled = false;
 
-$btnInfo && ($btnInfo.onclick = () => withBusy(async () => {
-  setErr("");
-  if ($raw) $raw.textContent = "(요청 중...)";
-  const url = firstUrl($inp?.value);
-  if (!url) { setErr("쿠팡 링크를 입력하세요."); return; }
-  try { await fillProductInfo(url); }
-  catch(e){ setErr(String(e?.message || e)); }
-}, "상품정보 불러오는 중…"));
+  refreshTpl();
+}
 
-$btnCopy && ($btnCopy.onclick = async () => {
-  try {
-    await navigator.clipboard.writeText($tpl?.textContent || "");
-    alert("복사되었습니다.");
-  } finally { resetUI(); }
-});
-$btnCopyLink && ($btnCopyLink.onclick = async () => {
-  if (!PARTNER_LINK) { alert("복사할 링크가 없습니다."); return; }
-  try {
-    await navigator.clipboard.writeText(PARTNER_LINK);
-    const prev = $btnCopyLink.textContent;
-    $btnCopyLink.textContent = "복사됨!";
-    setTimeout(()=>{ $btnCopyLink.textContent = prev; }, 800);
-  } finally { resetUI(); }
-});
+$("btnDeep").onclick = async () => {
+  if(BUSY) return;
+  setBusy(true);
+  try{
+    setErr("");
+    const url = firstUrl($("inp").value);
+    if(!url){ setErr("쿠팡 링크를 입력하세요."); return; }
+    $("deeplink").textContent="(생성 중...)";
+    await createDeeplink(url);
+    await fillProductInfo(url);
+  }catch(e){ setErr(e.message); }
+  finally{ setBusy(false); }
+};
 
-updateCopyLinkButton();
+$("btnInfo").onclick = async () => {
+  if(BUSY) return;
+  setBusy(true);
+  try{
+    const url = firstUrl($("inp").value);
+    if(!url){ setErr("쿠팡 링크를 입력하세요."); return; }
+    await fillProductInfo(url);
+  }catch(e){ setErr(e.message); }
+  finally{ setBusy(false); }
+};
+
+$("btnCopy").onclick = async () => {
+  await navigator.clipboard.writeText($("tpl").textContent);
+  alert("복사되었습니다.");
+  resetUI();
+};
+
+$("btnCopyLink").onclick = async () => {
+  const link = $("deeplink").textContent.trim();
+  if(!link || link.startsWith("(")) return;
+  await navigator.clipboard.writeText(link);
+  alert("링크 복사됨");
+  resetUI();
+};
+
 refreshTpl();
 </script>
 </body>
