@@ -118,9 +118,7 @@ $("btnCopyLink").onclick = async () => {
     if(!link || link.startsWith("(")) return;
     try {
         await navigator.clipboard.writeText(link);
-        if (confirm("Gemini 앱을 여시겠습니까?")) {
-            window.location.href = "googleapp://robin";
-        }
+        window.location.href = "https://gemini.google.com/app/a1fa8ccd8d3a43c7?utm_source=app_launcher&utm_medium=owned&utm_campaign=base_all";
     } catch (e) {
         alert("복사 실패: " + e.message);
     }
