@@ -118,7 +118,9 @@ $("btnCopyLink").onclick = async () => {
     if(!link || link.startsWith("(")) return;
     try {
         await navigator.clipboard.writeText(link);
-        window.location.href = "googleapp://robin";
+        if (confirm("Gemini 앱을 여시겠습니까?")) {
+            window.location.href = "googleapp://robin";
+        }
     } catch (e) {
         alert("복사 실패: " + e.message);
     }
