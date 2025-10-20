@@ -19,41 +19,32 @@ input[type=text]{width:100%;padding:14px;border:1px solid #e5e7eb;border-radius:
 .out{background:#fafafa;border:1px solid #e5e7eb;border-radius:12px;padding:12px;min-height:40px;font-size:14px;word-break:break-all}
 .error{color:#b00020;background:#fff1f1;border:1px solid #f3c2c2;padding:10px 12px;border-radius:10px;font-size:13px}
 .muted{color:#666;font-size:12px}
-
-/* ---- 버튼 활성화/비활성화 시 스타일 추가 ---- */
-.btn:disabled {
-    background: #ccc;
-    cursor: not-allowed;
-}
-.btn.secondary:disabled {
-    background: #f6f7f9;
-    color: #666;
-    border-color: #e5e7eb;
-}
+.btn:disabled{background:#ccc;cursor:not-allowed;}
+.btn.secondary:disabled{background:#f6f7f9;color:#666;border-color:#e5e7eb;}
 </style>
 </head>
 <body>
 <div class="wrap">
-  <div class="card">
-    <h1>쿠팡 딥링크 · 생성</h1>
+  <div class="card">
+    <h1>쿠팡 딥링크 · 생성</h1>
 
-    <label>문장 전체 붙여넣기 OK (첫 번째 http(s)만 인식)</label>
-    <input id="inp" type="text" placeholder="예) 쿠팡을 추천합니다! https://link.coupang.com/a/XXXXX" autocomplete="off" />
+    <label>문장 전체 붙여넣기 OK (첫 번째 http(s)만 인식)</label>
+    <input id="inp" type="text" placeholder="예) 쿠팡을 추천합니다! https://link.coupang.com/a/XXXXX" autocomplete="off" />
 
-    <div class="row" style="margin-top:10px">
-      <button id="btnDeep" class="btn">딥링크 생성</button>
-    </div>
+    <div class="row" style="margin-top:10px">
+      <button id="btnDeep" class="btn">딥링크 생성</button>
+    </div>
 
-    <div id="err" class="error" style="display:none;margin-top:10px"></div>
+    <div id="err" class="error" style="display:none;margin-top:10px"></div>
 
-    <div class="row-between" style="margin-top:14px">
-      <label style="margin:0">파트너스 링크</label>
-      <button id="btnCopyLink" class="btn secondary small" disabled>링크 복사</button>
-    </div>
-    <div id="deeplink" class="out">(아직 없음)</div>
-    <div class="muted">* 링크가 생성되면 ‘링크 복사’ 버튼이 활성화됩니다.</div>
+    <div class="row-between" style="margin-top:14px">
+      <label style="margin:0">파트너스 링크</label>
+      <button id="btnCopyLink" class="btn secondary small" disabled>링크 복사</button>
+    </div>
+    <div id="deeplink" class="out">(아직 없음)</div>
+    <div class="muted">* 링크가 생성되면 ‘링크 복사’ 버튼이 활성화됩니다.</div>
 
-  </div>
+  </div>
 </div>
 
 <script>
@@ -61,67 +52,67 @@ const $ = id => document.getElementById(id);
 const ENDPOINT_DEEP = "/.netlify/functions/create-deeplink";
 
 function firstUrl(input) {
-  const m = String(input || "").match(/https?:\/\/[^\s]+/i);
-  if (!m) return "";
-  return m[0].replace(/[)\]\},>.]+$/g, "");
+  const m = String(input || "").match(/https?:\/\/[^\s]+/i);
+  if (!m) return "";
+  return m[0].replace(/[)\]\},>.]+$/g, "");
 }
 function setErr(msg){ if(!msg){$("err").style.display="none";} else {$("err").style.display="block";$("err").textContent=msg;} }
 
 let BUSY = false;
 function setBusy(on) {
-  BUSY = on;
-  ["btnDeep","btnCopyLink"].forEach(id => {
-    const b = $(id); if(b) b.disabled = on;
-  });
+  BUSY = on;
+  ["btnDeep","btnCopyLink"].forEach(id => {
+    const b = $(id); if(b) b.disabled = on;
+  });
 }
 
 async function createDeeplink(url) {
-    const r = await fetch(ENDPOINT_DEEP, {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url})});
-    const txt = await r.text();
-    const j = JSON.parse(txt);
-    
-    if(!j.success) throw new Error(j.error || "딥링크 생성 실패");
-    
-    const shortLink = j.raw?.data?.[0]?.shortenUrl;
-    
-    if(!shortLink) throw new Error("딥링크를 찾을 수 없습니다.");
-    
-    $("deeplink").textContent = shortLink;
-    $("btnCopyLink").disabled = false;
-    
-    return shortLink;
+    const r = await fetch(ENDPOINT_DEEP, {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url})});
+    const txt = await r.text();
+    const j = JSON.parse(txt);
+    
+    if(!j.success) throw new Error(j.error || "딥링크 생성 실패");
+    
+    const shortLink = j.raw?.data?.[0]?.shortenUrl;
+    
+    if(!shortLink) throw new Error("딥링크를 찾을 수 없습니다.");
+    
+    $("deeplink").textContent = shortLink;
+    $("btnCopyLink").disabled = false;
+    
+    return shortLink;
 }
 
 $("btnDeep").onclick = async () => {
-    if(BUSY) return;
-    setBusy(true);
-    try{
-        setErr("");
-        const url = firstUrl($("inp").value);
-        if(!url){ setErr("쿠팡 링크를 입력하세요."); return; }
-        
-        $("deeplink").textContent="(생성 중...)";
-        await createDeeplink(url).catch(e => {
-             setErr(e.message);
-             $("deeplink").textContent = "(오류 발생)";
-             throw e;
-        });
-    }catch(e){ 
-        // 전역 오류 처리
-    }finally{ 
-        setBusy(false); 
-    }
+    if(BUSY) return;
+    setBusy(true);
+    try{
+        setErr("");
+        const url = firstUrl($("inp").value);
+        if(!url){ setErr("쿠팡 링크를 입력하세요."); return; }
+        
+        $("deeplink").textContent="(생성 중...)";
+        await createDeeplink(url).catch(e => {
+             setErr(e.message);
+             $("deeplink").textContent = "(오류 발생)";
+             throw e;
+        });
+    }catch(e){ 
+        // 전역 오류 처리
+    }finally{ 
+        setBusy(false); 
+    }
 };
 
 $("btnCopyLink").onclick = async () => {
-    const link = $("deeplink").textContent.trim();
-    if(!link || link.startsWith("(")) return;
-    try {
-        await navigator.clipboard.writeText(link);
-        window.location.href = "https://gemini.google.com/app/a1fa8ccd8d3a43c7?utm_source=app_launcher&utm_medium=owned&utm_campaign=base_all";
-    } catch (e) {
-        alert("복사 실패: " + e.message);
-    }
+    const link = $("deeplink").textContent.trim();
+    if(!link || link.startsWith("(")) return;
+    try {
+        await navigator.clipboard.writeText(link);
+        alert("✅ 링크가 복사되었습니다!");
+    } catch (e) {
+        alert("복사 실패: " + e.message);
+    }
 };
 </script>
 </body>
