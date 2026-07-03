@@ -1,22 +1,25 @@
-# NETLIFY_KUHOT_DeeplinkGate_v004_QueuedWaitNoRetry
+# NETLIFY_KUHOT_DeeplinkGate v005
 
-스크래퍼/에뮬 자동 반송에서 파트너스 링크가 간헐적으로 원본으로 나오는 문제를 줄이기 위한 Deeplink Gate입니다.
+환경변수 수정하기 번거로운 경우를 위해 안전 기본값을 코드에 박아 넣은 버전입니다.
 
-핵심 변경:
-- MIN_INTERVAL / INFLIGHT 상태에서 즉시 원본 fallback 하지 않음
-- API 슬롯이 날 때까지 최대 `DEEPLINK_QUEUE_WAIT_MS` 대기. 기본값 3000ms이며, PC/에뮬 10초 대기 안에 끝나도록 권장값도 3000ms입니다
-- 재시도 없음
-- API 호출은 요청당 1회만
-- product URL은 `productId + itemId + vendorItemId`만 남겨 정리 후 변환
+필수 환경변수는 쿠팡 파트너스 키만입니다.
 
-권장 환경변수:
+```text
+COUPANG_ACCESS_KEY
+COUPANG_SECRET_KEY
+COUPANG_SUB_ID 선택
 ```
+
+기본값:
+
+```text
 DEEPLINK_MAX_PER_MIN=30
 DEEPLINK_MIN_INTERVAL_MS=2200
-DEEPLINK_QUEUE_WAIT_MS=3000
+DEEPLINK_QUEUE_WAIT_MS=8000
+DEEPLINK_API_TIMEOUT_MS=8000
 DEEPLINK_RATE_COOLDOWN_MS=600000
 DEEPLINK_FAIL_CACHE_MS=600000
 DEEPLINK_SUCCESS_CACHE_MS=86400000
 ```
 
-GET `/api/create-deeplink`에서 `version=v004-queued-wait-no-retry` 확인.
+재시도는 없습니다. API 호출 전 슬롯 대기만 합니다.

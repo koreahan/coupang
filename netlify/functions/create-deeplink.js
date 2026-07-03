@@ -10,23 +10,23 @@ const CORS = {
   "Access-Control-Allow-Headers": "Content-Type"
 };
 
-const VERSION = "v004-queued-wait-no-retry";
+const VERSION = "v005-baked-safe-defaults-queued-wait";
 const ACCESS = process.env.COUPANG_ACCESS_KEY || "";
 const SECRET = process.env.COUPANG_SECRET_KEY || "";
 const SUB_ID = process.env.COUPANG_SUB_ID || "";
 
-const MAX_PER_MIN = Math.max(1, Number(process.env.DEEPLINK_MAX_PER_MIN || 50));
+const MAX_PER_MIN = Math.max(1, Number(process.env.DEEPLINK_MAX_PER_MIN || 30));
 const SUCCESS_CACHE_MS = Math.max(60_000, Number(process.env.DEEPLINK_SUCCESS_CACHE_MS || 24 * 60 * 60 * 1000));
 const FAIL_CACHE_MS = Math.max(10_000, Number(process.env.DEEPLINK_FAIL_CACHE_MS || 10 * 60 * 1000));
-const RATE_COOLDOWN_MS = Math.max(60_000, Number(process.env.DEEPLINK_RATE_COOLDOWN_MS || 60 * 1000));
-const MIN_INTERVAL_MS = Math.max(0, Number(process.env.DEEPLINK_MIN_INTERVAL_MS || 1200));
-const API_TIMEOUT_MS = Math.max(3000, Number(process.env.DEEPLINK_API_TIMEOUT_MS || 12000));
+const RATE_COOLDOWN_MS = Math.max(60_000, Number(process.env.DEEPLINK_RATE_COOLDOWN_MS || 10 * 60 * 1000));
+const MIN_INTERVAL_MS = Math.max(0, Number(process.env.DEEPLINK_MIN_INTERVAL_MS || 2200));
+const API_TIMEOUT_MS = Math.max(3000, Number(process.env.DEEPLINK_API_TIMEOUT_MS || 8000));
 const RESOLVE_SHORT_LINKS = String(process.env.DEEPLINK_RESOLVE_SHORT_LINKS || "true").toLowerCase() !== "false";
-const RESOLVE_TIMEOUT_MS = Math.max(2000, Number(process.env.DEEPLINK_RESOLVE_TIMEOUT_MS || 8000));
+const RESOLVE_TIMEOUT_MS = Math.max(2000, Number(process.env.DEEPLINK_RESOLVE_TIMEOUT_MS || 5000));
 const RESOLVE_CACHE_MS = Math.max(60_000, Number(process.env.DEEPLINK_RESOLVE_CACHE_MS || 24 * 60 * 60 * 1000));
 // v004: 자동 스크래퍼/에뮬 동시 호출이 MIN_INTERVAL/INFLIGHT 때문에 원본 fallback 되는 문제 방지.
 // 재시도는 하지 않고, API 호출 전 슬롯이 날 때까지 최대 이 시간만 기다린다.
-const QUEUE_WAIT_MS = Math.max(0, Number(process.env.DEEPLINK_QUEUE_WAIT_MS || 3000));
+const QUEUE_WAIT_MS = Math.max(0, Number(process.env.DEEPLINK_QUEUE_WAIT_MS || 8000));
 
 // Netlify Functions are serverless. These in-memory guards work per warm instance.
 // For perfect multi-instance/global rate limiting, put the same state in Redis/Netlify Blobs later.
@@ -313,6 +313,15 @@ exports.handler = async (event) => {
         fallbackOriginal: true,
         queueWaitInsteadOfFallback: true,
         queueWaitMs: QUEUE_WAIT_MS,
+        bakedDefaults: {
+          maxPerMinute: 30,
+          minIntervalMs: 2200,
+          queueWaitMs: 8000,
+          apiTimeoutMs: 8000,
+          rateCooldownMs: 600000,
+          failCacheMs: 600000,
+          successCacheMs: 86400000
+        },
         cooldownUntil: iso(state.cooldownUntil)
       },
       state: {
