@@ -10,7 +10,7 @@ const CORS = {
   "Access-Control-Allow-Headers": "Content-Type"
 };
 
-const VERSION = "v003-safe50-shortlink-resolve";
+const VERSION = "v004-queued-wait-no-retry";
 const ACCESS = process.env.COUPANG_ACCESS_KEY || "";
 const SECRET = process.env.COUPANG_SECRET_KEY || "";
 const SUB_ID = process.env.COUPANG_SUB_ID || "";
@@ -24,6 +24,9 @@ const API_TIMEOUT_MS = Math.max(3000, Number(process.env.DEEPLINK_API_TIMEOUT_MS
 const RESOLVE_SHORT_LINKS = String(process.env.DEEPLINK_RESOLVE_SHORT_LINKS || "true").toLowerCase() !== "false";
 const RESOLVE_TIMEOUT_MS = Math.max(2000, Number(process.env.DEEPLINK_RESOLVE_TIMEOUT_MS || 8000));
 const RESOLVE_CACHE_MS = Math.max(60_000, Number(process.env.DEEPLINK_RESOLVE_CACHE_MS || 24 * 60 * 60 * 1000));
+// v004: 자동 스크래퍼/에뮬 동시 호출이 MIN_INTERVAL/INFLIGHT 때문에 원본 fallback 되는 문제 방지.
+// 재시도는 하지 않고, API 호출 전 슬롯이 날 때까지 최대 이 시간만 기다린다.
+const QUEUE_WAIT_MS = Math.max(0, Number(process.env.DEEPLINK_QUEUE_WAIT_MS || 3000));
 
 // Netlify Functions are serverless. These in-memory guards work per warm instance.
 // For perfect multi-instance/global rate limiting, put the same state in Redis/Netlify Blobs later.
@@ -35,7 +38,9 @@ const state = global.__KUHOT_DEEPLINK_GATE_STATE__ || {
   minuteCount: 0,
   cooldownUntil: 0,
   lastApiAt: 0,
-  inFlight: false
+  inFlight: false,
+  lastQueueWaitMs: 0,
+  queueTimeouts: 0
 };
 global.__KUHOT_DEEPLINK_GATE_STATE__ = state;
 
@@ -55,13 +60,31 @@ function normalizeInputUrl(input) {
   let u;
   try { u = new URL(original); } catch { return original; }
 
+  // v004: Coupang product URL은 파트너스 변환에 필요한 productId/itemId/vendorItemId만 남긴다.
+  // sourceType/categoryId 등 스크래퍼/앱 경로 잡음 때문에 간헐적으로 원본 fallback 되는 것을 줄인다.
+  const host = u.hostname.replace(/^www\./i, '').toLowerCase();
+  const m = u.pathname.match(/\/vp\/products\/(\d+)/i);
+  if (host === 'coupang.com' && m) {
+    const clean = new URL(`https://www.coupang.com/vp/products/${m[1]}`);
+    for (const key of ['itemId', 'vendorItemId']) {
+      const v = u.searchParams.get(key);
+      if (v) clean.searchParams.set(key, v);
+    }
+    return clean.toString();
+  }
+
   // Remove noisy tracking params only. Product detail crawling is not performed here.
   [
     "abTestInfo", "src", "spec", "addtag", "ctag", "lptag", "itime", "wTime", "wPcid", "wRef",
     "traceid", "pageType", "pageValue", "mcid", "placementid", "clickBeacon", "campaignid",
-    "requestid", "impressionid", "landing_exp", "subparam", "deviceid", "token"
+    "requestid", "impressionid", "landing_exp", "subparam", "deviceid", "token",
+    "sourceType", "categoryId", "q", "searchId", "rank", "isAddedCart"
   ].forEach((p) => u.searchParams.delete(p));
   return u.toString();
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, Math.max(0, ms)));
 }
 
 function isShortCoupangLink(input) {
@@ -159,6 +182,46 @@ function canCallApi() {
   return { ok: true };
 }
 
+async function reserveApiSlot(maxWaitMs = QUEUE_WAIT_MS) {
+  const started = now();
+  const maxWait = Math.max(0, Number(maxWaitMs || 0));
+
+  while (true) {
+    const t = now();
+    if (state.cooldownUntil && t < state.cooldownUntil) {
+      return { ok: false, reason: "COOLDOWN_ACTIVE", retryAfterMs: state.cooldownUntil - t, queuedWaitMs: t - started };
+    }
+
+    resetMinuteIfNeeded();
+    if (state.minuteCount >= MAX_PER_MIN) {
+      const retryAfterMs = getRetryAfterMs();
+      state.cooldownUntil = Math.max(state.cooldownUntil || 0, t + retryAfterMs);
+      return { ok: false, reason: "LOCAL_RATE_LIMIT", retryAfterMs, queuedWaitMs: t - started };
+    }
+
+    const sinceLast = t - (state.lastApiAt || 0);
+    const waitInflight = state.inFlight ? Math.max(250, MIN_INTERVAL_MS) : 0;
+    const waitInterval = sinceLast < MIN_INTERVAL_MS ? (MIN_INTERVAL_MS - sinceLast) : 0;
+    const waitMs = Math.max(waitInflight, waitInterval);
+
+    if (waitMs <= 0) {
+      state.inFlight = true;
+      markApiCall();
+      state.lastQueueWaitMs = now() - started;
+      return { ok: true, queuedWaitMs: state.lastQueueWaitMs };
+    }
+
+    const elapsed = t - started;
+    if (elapsed + waitMs > maxWait) {
+      state.queueTimeouts += 1;
+      state.lastQueueWaitMs = elapsed;
+      return { ok: false, reason: "QUEUE_WAIT_TIMEOUT", retryAfterMs: waitMs, queuedWaitMs: elapsed };
+    }
+
+    await sleep(waitMs + 25);
+  }
+}
+
 function markApiCall() {
   resetMinuteIfNeeded();
   state.minuteCount += 1;
@@ -248,6 +311,8 @@ exports.handler = async (event) => {
         resolveShortLinks: RESOLVE_SHORT_LINKS,
         resolveRetry: false,
         fallbackOriginal: true,
+        queueWaitInsteadOfFallback: true,
+        queueWaitMs: QUEUE_WAIT_MS,
         cooldownUntil: iso(state.cooldownUntil)
       },
       state: {
@@ -256,7 +321,11 @@ exports.handler = async (event) => {
         cooldownUntil: iso(state.cooldownUntil),
         successCacheSize: state.successCache.size,
         failCacheSize: state.failCache.size,
-        resolveCacheSize: state.resolveCache.size
+        resolveCacheSize: state.resolveCache.size,
+        inFlight: state.inFlight,
+        lastApiAt: iso(state.lastApiAt),
+        lastQueueWaitMs: state.lastQueueWaitMs,
+        queueTimeouts: state.queueTimeouts
       }
     });
   }
@@ -367,17 +436,15 @@ exports.handler = async (event) => {
     return json(fallback(originalUrl, normalizedUrl, "ENV_MISSING", { env: { accessKey: Boolean(ACCESS), secretKey: Boolean(SECRET), subId: Boolean(SUB_ID) } }));
   }
 
-  const gate = canCallApi();
+  const gate = await reserveApiSlot(QUEUE_WAIT_MS);
   if (!gate.ok) {
     return json(fallback(originalUrl, normalizedUrl, gate.reason, {
       cooldown: gate.reason === "COOLDOWN_ACTIVE" || gate.reason === "LOCAL_RATE_LIMIT",
       retryAfterMs: gate.retryAfterMs,
+      queuedWaitMs: gate.queuedWaitMs,
       cooldownUntil: iso(state.cooldownUntil)
     }));
   }
-
-  state.inFlight = true;
-  markApiCall();
 
   try {
     const { header } = buildAuth("POST", PATH, "");
@@ -411,6 +478,7 @@ exports.handler = async (event) => {
         resolveInfo,
         source: "api",
         apiCalled: true,
+        queuedWaitMs: gate.queuedWaitMs,
         upstreamStatus: resp.status,
         version: VERSION
       });
@@ -421,6 +489,7 @@ exports.handler = async (event) => {
     setCache(state.failCache, normalizedUrl, { error: errText.slice(0, 500) }, FAIL_CACHE_MS);
     return json(fallback(originalUrl, normalizedUrl, rate ? "UPSTREAM_RATE_LIMIT" : "UPSTREAM_NO_LINK", {
       apiCalled: true,
+      queuedWaitMs: gate.queuedWaitMs,
       upstreamStatus: resp.status,
       upstreamData: resp.data,
       cooldown: Boolean(rate),
@@ -433,6 +502,7 @@ exports.handler = async (event) => {
     setCache(state.failCache, normalizedUrl, { error: errText.slice(0, 500) }, FAIL_CACHE_MS);
     return json(fallback(originalUrl, normalizedUrl, rate ? "UPSTREAM_RATE_LIMIT" : "UPSTREAM_ERROR", {
       apiCalled: true,
+      queuedWaitMs: gate.queuedWaitMs,
       error: errText.slice(0, 500),
       cooldown: Boolean(rate),
       retryAfterMs: rate?.retryAfterMs || FAIL_CACHE_MS,
