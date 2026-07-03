@@ -10,7 +10,7 @@ const CORS = {
   "Access-Control-Allow-Headers": "Content-Type"
 };
 
-const VERSION = "v002-safe50permin-bodyparser";
+const VERSION = "v003-safe50-shortlink-resolve";
 const ACCESS = process.env.COUPANG_ACCESS_KEY || "";
 const SECRET = process.env.COUPANG_SECRET_KEY || "";
 const SUB_ID = process.env.COUPANG_SUB_ID || "";
@@ -21,12 +21,16 @@ const FAIL_CACHE_MS = Math.max(10_000, Number(process.env.DEEPLINK_FAIL_CACHE_MS
 const RATE_COOLDOWN_MS = Math.max(60_000, Number(process.env.DEEPLINK_RATE_COOLDOWN_MS || 60 * 1000));
 const MIN_INTERVAL_MS = Math.max(0, Number(process.env.DEEPLINK_MIN_INTERVAL_MS || 1200));
 const API_TIMEOUT_MS = Math.max(3000, Number(process.env.DEEPLINK_API_TIMEOUT_MS || 12000));
+const RESOLVE_SHORT_LINKS = String(process.env.DEEPLINK_RESOLVE_SHORT_LINKS || "true").toLowerCase() !== "false";
+const RESOLVE_TIMEOUT_MS = Math.max(2000, Number(process.env.DEEPLINK_RESOLVE_TIMEOUT_MS || 8000));
+const RESOLVE_CACHE_MS = Math.max(60_000, Number(process.env.DEEPLINK_RESOLVE_CACHE_MS || 24 * 60 * 60 * 1000));
 
 // Netlify Functions are serverless. These in-memory guards work per warm instance.
 // For perfect multi-instance/global rate limiting, put the same state in Redis/Netlify Blobs later.
 const state = global.__KUHOT_DEEPLINK_GATE_STATE__ || {
   successCache: new Map(),
   failCache: new Map(),
+  resolveCache: new Map(),
   minuteStart: 0,
   minuteCount: 0,
   cooldownUntil: 0,
@@ -51,13 +55,55 @@ function normalizeInputUrl(input) {
   let u;
   try { u = new URL(original); } catch { return original; }
 
-  // Remove noisy tracking params only. Do not resolve short links. No Coupang page lookup here.
+  // Remove noisy tracking params only. Product detail crawling is not performed here.
   [
     "abTestInfo", "src", "spec", "addtag", "ctag", "lptag", "itime", "wTime", "wPcid", "wRef",
     "traceid", "pageType", "pageValue", "mcid", "placementid", "clickBeacon", "campaignid",
     "requestid", "impressionid", "landing_exp", "subparam", "deviceid", "token"
   ].forEach((p) => u.searchParams.delete(p));
   return u.toString();
+}
+
+function isShortCoupangLink(input) {
+  return /^https?:\/\/link\.coupang\.com\//i.test(String(input || "").trim());
+}
+
+function isCoupangProductUrl(input) {
+  return /^https?:\/\/(www\.)?coupang\.com\//i.test(String(input || "").trim());
+}
+
+async function resolveShortLinkOnce(inputUrl) {
+  const original = String(inputUrl || "").trim();
+  if (!RESOLVE_SHORT_LINKS || !isShortCoupangLink(original)) {
+    return { url: normalizeInputUrl(original), resolved: false, skipped: !RESOLVE_SHORT_LINKS ? "DISABLED" : "NOT_SHORT" };
+  }
+
+  const cached = getCache(state.resolveCache, original);
+  if (cached?.resolvedUrl) {
+    return { url: cached.resolvedUrl, resolved: true, source: "resolve_cache" };
+  }
+
+  try {
+    const resp = await axios.head(original, {
+      maxRedirects: 0,
+      timeout: RESOLVE_TIMEOUT_MS,
+      validateStatus: (s) => s >= 200 && s < 400
+    }).catch((e) => e?.response || null);
+
+    const loc = resp?.headers?.location;
+    if (!loc) {
+      setCache(state.resolveCache, original, { error: "NO_LOCATION" }, FAIL_CACHE_MS);
+      return { url: normalizeInputUrl(original), resolved: false, error: "NO_LOCATION" };
+    }
+
+    const resolvedUrl = normalizeInputUrl(new URL(loc, original).toString());
+    setCache(state.resolveCache, original, { resolvedUrl }, RESOLVE_CACHE_MS);
+    return { url: resolvedUrl, resolved: true, source: "head_location" };
+  } catch (e) {
+    const err = String(e?.message || e || "RESOLVE_ERROR");
+    setCache(state.resolveCache, original, { error: err.slice(0, 300) }, FAIL_CACHE_MS);
+    return { url: normalizeInputUrl(original), resolved: false, error: err.slice(0, 300) };
+  }
 }
 
 function cacheKey(url) {
@@ -199,6 +245,7 @@ exports.handler = async (event) => {
         minIntervalMs: MIN_INTERVAL_MS,
         directMaxAttemptsPerRequest: 1,
         netlifyRetry: false,
+        resolveShortLinks: RESOLVE_SHORT_LINKS,
         resolveRetry: false,
         fallbackOriginal: true,
         cooldownUntil: iso(state.cooldownUntil)
@@ -208,7 +255,8 @@ exports.handler = async (event) => {
         minuteStart: iso(state.minuteStart),
         cooldownUntil: iso(state.cooldownUntil),
         successCacheSize: state.successCache.size,
-        failCacheSize: state.failCache.size
+        failCacheSize: state.failCache.size,
+        resolveCacheSize: state.resolveCache.size
       }
     });
   }
@@ -249,8 +297,19 @@ exports.handler = async (event) => {
   const originalUrl = String(body.url || body.coupangUrl || body.link || "").trim();
   if (!originalUrl) return json({ ok: false, success: false, error: "URL_REQUIRED", message: "url required" }, 400);
 
-  const normalizedUrl = cacheKey(originalUrl);
+  const resolveInfo = await resolveShortLinkOnce(originalUrl);
+  const normalizedUrl = cacheKey(resolveInfo.url || originalUrl);
   const dryRun = body.dryRun === true || body.dryRun === "true";
+
+  // Coupang Deeplink API는 link.coupang.com 단축링크를 그대로 넣으면 rCode 400/url convert failed가 날 수 있다.
+  // 단축링크 해제가 안 되면 API를 낭비하지 않고 원본 링크를 그대로 반환한다.
+  if (isShortCoupangLink(originalUrl) && !isCoupangProductUrl(normalizedUrl)) {
+    return json(fallback(originalUrl, normalizedUrl, "SHORT_LINK_RESOLVE_FAILED_NO_API", {
+      resolveInfo,
+      apiCalled: false,
+      retryAfterMs: FAIL_CACHE_MS
+    }));
+  }
 
   const successHit = getCache(state.successCache, normalizedUrl);
   if (successHit) {
@@ -268,6 +327,8 @@ exports.handler = async (event) => {
       convertedUrl: successHit.partnerUrl,
       originalUrl,
       normalizedUrl,
+      resolvedFromShortLink: resolveInfo.resolved,
+      resolveInfo,
       source: "success_cache",
       apiCalled: false,
       version: VERSION
@@ -292,6 +353,8 @@ exports.handler = async (event) => {
       dryRun: true,
       originalUrl,
       normalizedUrl,
+      resolvedFromShortLink: resolveInfo.resolved,
+      resolveInfo,
       wouldCallApi: gate.ok,
       gate,
       apiCalled: false,
@@ -344,6 +407,8 @@ exports.handler = async (event) => {
         convertedUrl: partnerUrl,
         originalUrl,
         normalizedUrl,
+        resolvedFromShortLink: resolveInfo.resolved,
+        resolveInfo,
         source: "api",
         apiCalled: true,
         upstreamStatus: resp.status,

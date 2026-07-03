@@ -20,7 +20,7 @@ exports.handler = async (event) => {
       success: true,
       ok: true,
       service: "kuhot-deeplink-gate",
-      version: "v002-safe50permin-bodyparser",
+      version: "v003-safe50-shortlink-resolve",
       functionsAlive: true,
       hasEnv: hasAccessKey && hasSecretKey,
       env: {

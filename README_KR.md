@@ -1,4 +1,4 @@
-# KUHOT Deeplink Gate v002
+# KUHOT Deeplink Gate v003
 
 서버(Render)가 아니라 Netlify 한 곳에서만 Coupang Partners Deeplink API를 호출하기 위한 안전 게이트입니다.
 
@@ -23,6 +23,8 @@ DEEPLINK_MIN_INTERVAL_MS=1200
 DEEPLINK_SUCCESS_CACHE_MS=86400000
 DEEPLINK_FAIL_CACHE_MS=600000
 DEEPLINK_RATE_COOLDOWN_MS=60000
+DEEPLINK_RESOLVE_SHORT_LINKS=true
+DEEPLINK_RESOLVE_TIMEOUT_MS=8000
 ```
 
 ## 배포 후 안전 확인
@@ -66,3 +68,11 @@ Netlify Functions의 메모리 캐시/카운터는 warm instance 기준입니다
 - PowerShell `curl.exe -d $body`에서 JSON 따옴표가 깨져도 URL을 최대한 복구합니다.
 - `application/json`, `application/x-www-form-urlencoded`, plain URL 입력을 모두 허용합니다.
 - `/api/ping`, `/api/create-deeplink` redirect를 포함했습니다.
+
+
+## v003 변경
+
+- `link.coupang.com/a/...` 단축링크를 Deeplink API에 그대로 넣으면 Coupang upstream이 `rCode: 400 / url convert failed`를 반환할 수 있어, API 호출 전 `HEAD` 1회로 원본 `coupang.com` 상품 URL을 해제합니다.
+- 단축링크 해제는 성공/실패 캐시를 사용합니다.
+- 단축링크 해제가 실패하면 Deeplink API를 호출하지 않고 원본 링크 fallback을 반환합니다.
+- 여전히 Deeplink API는 1요청당 최대 1회만 호출합니다.
