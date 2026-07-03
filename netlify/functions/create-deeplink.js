@@ -10,7 +10,7 @@ const CORS = {
   "Access-Control-Allow-Headers": "Content-Type"
 };
 
-const VERSION = "v001-safe50permin";
+const VERSION = "v002-safe50permin-bodyparser";
 const ACCESS = process.env.COUPANG_ACCESS_KEY || "";
 const SECRET = process.env.COUPANG_SECRET_KEY || "";
 const SUB_ID = process.env.COUPANG_SUB_ID || "";
@@ -218,8 +218,33 @@ exports.handler = async (event) => {
   }
 
   let body = {};
-  try { body = JSON.parse(event.body || "{}"); }
-  catch { return json({ ok: false, success: false, error: "BAD_JSON" }, 400); }
+  try {
+    const rawBody = String(event.body || "").trim();
+    if (!rawBody) {
+      body = {};
+    } else {
+      try {
+        body = JSON.parse(rawBody);
+      } catch (_) {
+        // PowerShell + curl.exe 조합에서 -d $body 사용 시 내부 따옴표가 깨져 {url:https://...} 형태로 들어오는 경우 방어.
+        // 또한 x-www-form-urlencoded(url=...)와 plain URL도 허용한다.
+        const ctype = String(event.headers?.["content-type"] || event.headers?.["Content-Type"] || "").toLowerCase();
+        if (ctype.includes("application/x-www-form-urlencoded") || rawBody.includes("url=")) {
+          const params = new URLSearchParams(rawBody);
+          body = Object.fromEntries(params.entries());
+        } else if (/^https?:\/\//i.test(rawBody)) {
+          body = { url: rawBody };
+        } else {
+          const m = rawBody.match(/(?:"|')?url(?:"|')?\s*[:=]\s*(?:"|')?(https?:\/\/[^"'\s}]+)(?:"|')?/i)
+            || rawBody.match(/(https?:\/\/[^"'\s}]+)/i);
+          if (m) body = { url: m[1] };
+          else return json({ ok: false, success: false, error: "BAD_JSON", hint: "Send JSON like {\"url\":\"https://link.coupang.com/a/...\"}" }, 400);
+        }
+      }
+    }
+  } catch (_) {
+    return json({ ok: false, success: false, error: "BAD_BODY" }, 400);
+  }
 
   const originalUrl = String(body.url || body.coupangUrl || body.link || "").trim();
   if (!originalUrl) return json({ ok: false, success: false, error: "URL_REQUIRED", message: "url required" }, 400);

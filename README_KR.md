@@ -1,4 +1,4 @@
-# KUHOT Deeplink Gate v001
+# KUHOT Deeplink Gate v002
 
 서버(Render)가 아니라 Netlify 한 곳에서만 Coupang Partners Deeplink API를 호출하기 위한 안전 게이트입니다.
 
@@ -30,8 +30,8 @@ DEEPLINK_RATE_COOLDOWN_MS=60000
 쿠팡 API 호출 없음:
 
 ```powershell
-Invoke-WebRequest "https://coupangga.netlify.app/.netlify/functions/ping"
-Invoke-WebRequest "https://coupangga.netlify.app/.netlify/functions/create-deeplink" -Method GET
+Invoke-WebRequest "https://coupanga.netlify.app/.netlify/functions/ping"
+Invoke-WebRequest "https://coupanga.netlify.app/.netlify/functions/create-deeplink" -Method GET
 ```
 
 ## 실제 변환 호출
@@ -41,7 +41,7 @@ Invoke-WebRequest "https://coupangga.netlify.app/.netlify/functions/create-deepl
 ```powershell
 $body = @{ url = "https://www.coupang.com/vp/products/6269223291?itemId=17905188990&vendorItemId=85067938409" } | ConvertTo-Json -Compress
 Invoke-RestMethod `
-  -Uri "https://coupangga.netlify.app/.netlify/functions/create-deeplink" `
+  -Uri "https://coupanga.netlify.app/.netlify/functions/create-deeplink" `
   -Method Post `
   -ContentType "application/json" `
   -Body $body
@@ -59,3 +59,10 @@ Invoke-RestMethod `
 ## 주의
 
 Netlify Functions의 메모리 캐시/카운터는 warm instance 기준입니다. 여러 인스턴스가 동시에 뜨는 고트래픽 환경에서는 완전한 글로벌 제한을 위해 Redis/Netlify Blobs 같은 공유 저장소가 필요합니다.
+
+
+## v002 변경
+
+- PowerShell `curl.exe -d $body`에서 JSON 따옴표가 깨져도 URL을 최대한 복구합니다.
+- `application/json`, `application/x-www-form-urlencoded`, plain URL 입력을 모두 허용합니다.
+- `/api/ping`, `/api/create-deeplink` redirect를 포함했습니다.
