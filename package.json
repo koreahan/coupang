@@ -1,9 +1,0 @@
-{
-  "name": "kuhot-deeplink-gate",
-  "version": "1.0.0",
-  "private": true,
-  "license": "MIT",
-  "dependencies": {
-    "axios": "^1.6.0"
-  }
-}
