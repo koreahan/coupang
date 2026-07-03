@@ -4,3 +4,13 @@
 
 [functions]
   node_bundler = "esbuild"
+
+[[redirects]]
+  from = "/api/ping"
+  to = "/.netlify/functions/ping"
+  status = 200
+
+[[redirects]]
+  from = "/api/create-deeplink"
+  to = "/.netlify/functions/create-deeplink"
+  status = 200
