@@ -1,24 +1,133 @@
-// netlify/functions/create-deeplink.js
 const crypto = require("crypto");
 const axios = require("axios");
 
 const HOST = "https://api-gateway.coupang.com";
 const PATH = "/v2/providers/affiliate_open_api/apis/openapi/v1/deeplink";
 
-const ACCESS = process.env.COUPANG_ACCESS_KEY;
-const SECRET = process.env.COUPANG_SECRET_KEY;
+const CORS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type"
+};
+
+const VERSION = "v001-safe50permin";
+const ACCESS = process.env.COUPANG_ACCESS_KEY || "";
+const SECRET = process.env.COUPANG_SECRET_KEY || "";
+const SUB_ID = process.env.COUPANG_SUB_ID || "";
+
+const MAX_PER_MIN = Math.max(1, Number(process.env.DEEPLINK_MAX_PER_MIN || 50));
+const SUCCESS_CACHE_MS = Math.max(60_000, Number(process.env.DEEPLINK_SUCCESS_CACHE_MS || 24 * 60 * 60 * 1000));
+const FAIL_CACHE_MS = Math.max(10_000, Number(process.env.DEEPLINK_FAIL_CACHE_MS || 10 * 60 * 1000));
+const RATE_COOLDOWN_MS = Math.max(60_000, Number(process.env.DEEPLINK_RATE_COOLDOWN_MS || 60 * 1000));
+const MIN_INTERVAL_MS = Math.max(0, Number(process.env.DEEPLINK_MIN_INTERVAL_MS || 1200));
+const API_TIMEOUT_MS = Math.max(3000, Number(process.env.DEEPLINK_API_TIMEOUT_MS || 12000));
+
+// Netlify Functions are serverless. These in-memory guards work per warm instance.
+// For perfect multi-instance/global rate limiting, put the same state in Redis/Netlify Blobs later.
+const state = global.__KUHOT_DEEPLINK_GATE_STATE__ || {
+  successCache: new Map(),
+  failCache: new Map(),
+  minuteStart: 0,
+  minuteCount: 0,
+  cooldownUntil: 0,
+  lastApiAt: 0,
+  inFlight: false
+};
+global.__KUHOT_DEEPLINK_GATE_STATE__ = state;
+
+function now() { return Date.now(); }
+function iso(ts) { return ts ? new Date(ts).toISOString() : null; }
+function json(obj, code = 200) {
+  return {
+    statusCode: code,
+    headers: { "Content-Type": "application/json; charset=utf-8", ...CORS },
+    body: JSON.stringify(obj)
+  };
+}
+
+function normalizeInputUrl(input) {
+  const original = String(input || "").trim();
+  if (!original) return "";
+  let u;
+  try { u = new URL(original); } catch { return original; }
+
+  // Remove noisy tracking params only. Do not resolve short links. No Coupang page lookup here.
+  [
+    "abTestInfo", "src", "spec", "addtag", "ctag", "lptag", "itime", "wTime", "wPcid", "wRef",
+    "traceid", "pageType", "pageValue", "mcid", "placementid", "clickBeacon", "campaignid",
+    "requestid", "impressionid", "landing_exp", "subparam", "deviceid", "token"
+  ].forEach((p) => u.searchParams.delete(p));
+  return u.toString();
+}
+
+function cacheKey(url) {
+  return normalizeInputUrl(url);
+}
+
+function getCache(map, key) {
+  const hit = map.get(key);
+  if (!hit) return null;
+  if (hit.expiresAt <= now()) {
+    map.delete(key);
+    return null;
+  }
+  return hit;
+}
+
+function setCache(map, key, value, ttl) {
+  map.set(key, { ...value, expiresAt: now() + ttl });
+}
+
+function resetMinuteIfNeeded() {
+  const t = now();
+  if (!state.minuteStart || t - state.minuteStart >= 60_000) {
+    state.minuteStart = t;
+    state.minuteCount = 0;
+  }
+}
+
+function getRetryAfterMs() {
+  resetMinuteIfNeeded();
+  return Math.max(0, 60_000 - (now() - state.minuteStart));
+}
+
+function canCallApi() {
+  const t = now();
+  if (state.cooldownUntil && t < state.cooldownUntil) {
+    return { ok: false, reason: "COOLDOWN_ACTIVE", retryAfterMs: state.cooldownUntil - t };
+  }
+  resetMinuteIfNeeded();
+  if (state.minuteCount >= MAX_PER_MIN) {
+    const retryAfterMs = getRetryAfterMs();
+    // Local cooldown until next minute. Do not hold the serverless function open for 60 seconds.
+    state.cooldownUntil = Math.max(state.cooldownUntil || 0, t + retryAfterMs);
+    return { ok: false, reason: "LOCAL_RATE_LIMIT", retryAfterMs };
+  }
+  if (state.inFlight) {
+    return { ok: false, reason: "INFLIGHT_BUSY", retryAfterMs: Math.max(1000, MIN_INTERVAL_MS) };
+  }
+  const sinceLast = t - (state.lastApiAt || 0);
+  if (sinceLast < MIN_INTERVAL_MS) {
+    return { ok: false, reason: "MIN_INTERVAL", retryAfterMs: MIN_INTERVAL_MS - sinceLast };
+  }
+  return { ok: true };
+}
+
+function markApiCall() {
+  resetMinuteIfNeeded();
+  state.minuteCount += 1;
+  state.lastApiAt = now();
+}
 
 function utcSignedDate() {
   const d = new Date();
-  const p = n => String(n).padStart(2, "0");
-  return (
-    String(d.getUTCFullYear()).slice(2) +
+  const p = (n) => String(n).padStart(2, "0");
+  return String(d.getUTCFullYear()).slice(2) +
     p(d.getUTCMonth() + 1) +
     p(d.getUTCDate()) + "T" +
     p(d.getUTCHours()) +
     p(d.getUTCMinutes()) +
-    p(d.getUTCSeconds()) + "Z"
-  );
+    p(d.getUTCSeconds()) + "Z";
 }
 
 function buildAuth(method, path, query = "") {
@@ -26,177 +135,220 @@ function buildAuth(method, path, query = "") {
   const message = `${datetime}${method.toUpperCase()}${path}${query}`;
   const signature = crypto.createHmac("sha256", SECRET).update(message, "utf8").digest("hex");
   const header = `CEA algorithm=HmacSHA256,access-key=${ACCESS},signed-date=${datetime},signature=${signature}`;
-  return { header, datetime, message, signature };
+  return { header, datetime };
 }
 
-// --- short 링크 해제 (link.coupang.com → www.coupang.com) ---
-async function resolveShortIfNeeded(inputUrl) {
-  const isShort = /^https?:\/\/link\.coupang\.com\//i.test(inputUrl);
-  if (!isShort) return inputUrl;
+function extractPartnerLink(data) {
+  const item = Array.isArray(data?.data) ? data.data[0] : null;
+  return item?.shortenUrl || item?.landingUrl || item?.shortenUrlMobile || null;
+}
 
-  // 최대 5번까지 30x 따라감(HEAD → Location)
-  let cur = inputUrl;
-  for (let i = 0; i < 5; i++) {
-    // redirects를 우리가 직접 따라가기 위해 3xx만 허용
-    const r = await axios
-      .head(cur, {
-        maxRedirects: 0,
-        validateStatus: (s) => s >= 200 && s < 400,
-        timeout: 15000
-      })
-      .catch((e) => e?.response);
+function stringifyErrorData(v) {
+  if (typeof v === "string") return v;
+  try { return JSON.stringify(v); } catch { return String(v); }
+}
 
-    if (!r) break;
-
-    const loc = r.headers?.location;
-    if (!loc) break;
-
-    // 상대경로 대비
-    cur = new URL(loc, cur).toString();
-
-    // 원본 상품 도메인으로 오면 종료
-    if (/^https?:\/\/(www\.)?coupang\.com\//i.test(cur)) {
-      return cur;
-    }
+function detectRateLimit(text) {
+  const s = String(text || "");
+  if (!/(사용 횟수|초과|rate|limit|Too Many Requests|429|총\s*3회)/i.test(s)) return null;
+  const m = s.match(/(20\d{2}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?)/);
+  let until = now() + RATE_COOLDOWN_MS;
+  if (m) {
+    const parsed = Date.parse(m[1] + "+09:00");
+    if (Number.isFinite(parsed)) until = Math.max(until, parsed);
   }
-  // 못 풀어도 일단 현재값 반환(하단에서 한 번 더 검증)
-  return cur;
+  state.cooldownUntil = Math.max(state.cooldownUntil || 0, until);
+  return { cooldownUntil: state.cooldownUntil, retryAfterMs: Math.max(0, state.cooldownUntil - now()) };
+}
+
+function fallback(originalUrl, normalizedUrl, reason, extra = {}) {
+  return {
+    ok: true,
+    success: true,
+    partnerOk: false,
+    fallbackOriginal: true,
+    reason,
+    url: originalUrl,
+    link: originalUrl,
+    partnerUrl: originalUrl,
+    partnersUrl: originalUrl,
+    finalUrl: originalUrl,
+    deepLink: originalUrl,
+    deeplink: originalUrl,
+    convertedUrl: originalUrl,
+    originalUrl,
+    normalizedUrl,
+    apiCalled: false,
+    version: VERSION,
+    ...extra
+  };
 }
 
 exports.handler = async (event) => {
-  const qs = event.queryStringParameters || {};
-  const debug = qs.debug === "1";
+  if (event.httpMethod === "OPTIONS") return { statusCode: 200, headers: CORS, body: "" };
+
+  if (event.httpMethod === "GET") {
+    return json({
+      ok: true,
+      success: true,
+      service: "kuhot-deeplink-gate",
+      version: VERSION,
+      message: "POST only for deeplink conversion. GET is health/dry status only.",
+      policy: {
+        maxPerMinute: MAX_PER_MIN,
+        minIntervalMs: MIN_INTERVAL_MS,
+        directMaxAttemptsPerRequest: 1,
+        netlifyRetry: false,
+        resolveRetry: false,
+        fallbackOriginal: true,
+        cooldownUntil: iso(state.cooldownUntil)
+      },
+      state: {
+        minuteCount: state.minuteCount,
+        minuteStart: iso(state.minuteStart),
+        cooldownUntil: iso(state.cooldownUntil),
+        successCacheSize: state.successCache.size,
+        failCacheSize: state.failCache.size
+      }
+    });
+  }
 
   if (event.httpMethod !== "POST") {
-    return {
-      statusCode: 405,
-      body: JSON.stringify({
-        success: false,
-        error: { code: "METHOD_NOT_ALLOWED", message: "POST only" }
-      })
-    };
+    return json({ ok: false, success: false, error: "METHOD_NOT_ALLOWED", message: "POST only" }, 405);
   }
 
-  // body 파싱
-  let url = "";
+  let body = {};
+  try { body = JSON.parse(event.body || "{}"); }
+  catch { return json({ ok: false, success: false, error: "BAD_JSON" }, 400); }
+
+  const originalUrl = String(body.url || body.coupangUrl || body.link || "").trim();
+  if (!originalUrl) return json({ ok: false, success: false, error: "URL_REQUIRED", message: "url required" }, 400);
+
+  const normalizedUrl = cacheKey(originalUrl);
+  const dryRun = body.dryRun === true || body.dryRun === "true";
+
+  const successHit = getCache(state.successCache, normalizedUrl);
+  if (successHit) {
+    return json({
+      ok: true,
+      success: true,
+      partnerOk: true,
+      url: successHit.partnerUrl,
+      link: successHit.partnerUrl,
+      partnerUrl: successHit.partnerUrl,
+      partnersUrl: successHit.partnerUrl,
+      finalUrl: successHit.partnerUrl,
+      deepLink: successHit.partnerUrl,
+      deeplink: successHit.partnerUrl,
+      convertedUrl: successHit.partnerUrl,
+      originalUrl,
+      normalizedUrl,
+      source: "success_cache",
+      apiCalled: false,
+      version: VERSION
+    });
+  }
+
+  const failHit = getCache(state.failCache, normalizedUrl);
+  if (failHit) {
+    return json(fallback(originalUrl, normalizedUrl, "FAIL_CACHE", {
+      source: "fail_cache",
+      retryAfterMs: Math.max(0, failHit.expiresAt - now()),
+      lastError: failHit.error
+    }));
+  }
+
+  if (dryRun) {
+    const gate = canCallApi();
+    return json({
+      ok: true,
+      success: true,
+      partnerOk: false,
+      dryRun: true,
+      originalUrl,
+      normalizedUrl,
+      wouldCallApi: gate.ok,
+      gate,
+      apiCalled: false,
+      version: VERSION
+    });
+  }
+
+  if (!ACCESS || !SECRET) {
+    setCache(state.failCache, normalizedUrl, { error: "ENV_MISSING" }, FAIL_CACHE_MS);
+    return json(fallback(originalUrl, normalizedUrl, "ENV_MISSING", { env: { accessKey: Boolean(ACCESS), secretKey: Boolean(SECRET), subId: Boolean(SUB_ID) } }));
+  }
+
+  const gate = canCallApi();
+  if (!gate.ok) {
+    return json(fallback(originalUrl, normalizedUrl, gate.reason, {
+      cooldown: gate.reason === "COOLDOWN_ACTIVE" || gate.reason === "LOCAL_RATE_LIMIT",
+      retryAfterMs: gate.retryAfterMs,
+      cooldownUntil: iso(state.cooldownUntil)
+    }));
+  }
+
+  state.inFlight = true;
+  markApiCall();
+
   try {
-    const body = JSON.parse(event.body || "{}");
-    url = (body.url || "").trim();
-  } catch {
-    return {
-      statusCode: 400,
-      body: JSON.stringify({
-        success: false,
-        error: { code: "BAD_JSON", message: "Invalid JSON body" }
-      })
-    };
-  }
-  if (!url) {
-    return {
-      statusCode: 400,
-      body: JSON.stringify({
-        success: false,
-        error: { code: "URL_REQUIRED", message: "url required" }
-      })
-    };
-  }
+    const { header } = buildAuth("POST", PATH, "");
+    const payload = { coupangUrls: [normalizedUrl] };
+    if (SUB_ID) payload.subId = SUB_ID;
 
-  // ★ 짧은링크면 먼저 원본으로 해제
-  let finalUrl;
-  try {
-    finalUrl = await resolveShortIfNeeded(url);
-  } catch (e) {
-    return {
-      statusCode: 502,
-      body: JSON.stringify({
-        success: false,
-        error: { code: "RESOLVE_FAILED", message: String(e?.message || e) },
-        input: { url, finalUrl: null }
-      })
-    };
-  }
+    const resp = await axios.post(`${HOST}${PATH}`, payload, {
+      headers: { Authorization: header, "Content-Type": "application/json" },
+      timeout: API_TIMEOUT_MS,
+      validateStatus: () => true
+    });
 
-  // 원본 도메인 검증 (쿠팡 상품 URL만 허용)
-  if (!/^https?:\/\/(www\.)?coupang\.com\//i.test(finalUrl)) {
-    return {
-      statusCode: 400,
-      body: JSON.stringify({
-        success: false,
-        error: {
-          code: "INVALID_URL",
-          message: "쿠팡 상품 원본 URL로 해제되지 않았습니다."
-        },
-        input: { url, finalUrl }
-      })
-    };
-  }
-
-  // 서명 빌드 (쿼리 없음)
-  const { header, datetime, message, signature } = buildAuth("POST", PATH, "");
-
-  try {
-    const resp = await axios.post(
-      `${HOST}${PATH}`,
-      { coupangUrls: [finalUrl] }, // ★ 원본 URL로 전송
-      {
-        headers: {
-          Authorization: header,
-          "Content-Type": "application/json"
-        },
-        timeout: 15000,
-        validateStatus: () => true
-      }
-    );
-
-    // debug 모드 응답
-    if (debug) {
-      return {
-        statusCode: resp.status,
-        body: JSON.stringify({
-          success: resp.status === 200 && resp.data?.data?.length > 0,
-          upstreamStatus: resp.status,
-          upstreamData: resp.data,
-          debug: {
-            datetime,
-            message,
-            signature: signature.slice(0, 16) + "..."
-          },
-          input: { url, finalUrl }
-        })
-      };
+    const partnerUrl = resp.status === 200 ? extractPartnerLink(resp.data) : null;
+    if (partnerUrl) {
+      setCache(state.successCache, normalizedUrl, { partnerUrl }, SUCCESS_CACHE_MS);
+      return json({
+        ok: true,
+        success: true,
+        partnerOk: true,
+        url: partnerUrl,
+        link: partnerUrl,
+        partnerUrl,
+        partnersUrl: partnerUrl,
+        finalUrl: partnerUrl,
+        deepLink: partnerUrl,
+        deeplink: partnerUrl,
+        convertedUrl: partnerUrl,
+        originalUrl,
+        normalizedUrl,
+        source: "api",
+        apiCalled: true,
+        upstreamStatus: resp.status,
+        version: VERSION
+      });
     }
 
-    if (resp.status === 200 && resp.data?.data?.length) {
-      const item = resp.data.data[0];
-      const link = item?.shortenUrl || item?.landingUrl || null;
-      return {
-        statusCode: 200,
-        body: JSON.stringify({ success: true, link, raw: resp.data })
-      };
-    }
-
-    // 업스트림이 200인데 rCode 400 같은 경우를 위해 원문 그대로 반환
-    return {
-      statusCode: 502,
-      body: JSON.stringify({
-        success: false,
-        reason: "UPSTREAM_ERROR",
-        status: resp.status,
-        data: resp.data,
-        input: { url, finalUrl }
-      })
-    };
+    const errText = stringifyErrorData(resp.data);
+    const rate = detectRateLimit(errText || resp.status);
+    setCache(state.failCache, normalizedUrl, { error: errText.slice(0, 500) }, FAIL_CACHE_MS);
+    return json(fallback(originalUrl, normalizedUrl, rate ? "UPSTREAM_RATE_LIMIT" : "UPSTREAM_NO_LINK", {
+      apiCalled: true,
+      upstreamStatus: resp.status,
+      upstreamData: resp.data,
+      cooldown: Boolean(rate),
+      retryAfterMs: rate?.retryAfterMs || FAIL_CACHE_MS,
+      cooldownUntil: rate ? iso(rate.cooldownUntil) : iso(state.cooldownUntil)
+    }));
   } catch (e) {
-    return {
-      statusCode: 502,
-      body: JSON.stringify({
-        success: false,
-        error: {
-          code: "UPSTREAM_ERROR",
-          message: String(e?.response?.data || e.message)
-        },
-        input: { url, finalUrl }
-      })
-    };
+    const errText = stringifyErrorData(e?.response?.data || e?.message || e);
+    const rate = detectRateLimit(errText);
+    setCache(state.failCache, normalizedUrl, { error: errText.slice(0, 500) }, FAIL_CACHE_MS);
+    return json(fallback(originalUrl, normalizedUrl, rate ? "UPSTREAM_RATE_LIMIT" : "UPSTREAM_ERROR", {
+      apiCalled: true,
+      error: errText.slice(0, 500),
+      cooldown: Boolean(rate),
+      retryAfterMs: rate?.retryAfterMs || FAIL_CACHE_MS,
+      cooldownUntil: rate ? iso(rate.cooldownUntil) : iso(state.cooldownUntil)
+    }));
+  } finally {
+    state.inFlight = false;
   }
 };
